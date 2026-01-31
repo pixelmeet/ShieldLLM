@@ -70,7 +70,7 @@ async function seed() {
     const demoSession = await Session.create({
         userId: users[1]._id, // Developer
         toolType: 'code_review',
-        modelType: 'gpt_class',
+        modelType: 'huggingface',
         defenseMode: 'active',
         trustScore: 100,
         intentGraph: {

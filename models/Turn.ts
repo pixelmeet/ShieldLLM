@@ -21,6 +21,12 @@ const TurnSchema = new Schema({
         enum: ['allow', 'clarify', 'sanitize_rerun', 'contain'],
         default: 'allow'
     },
+    divergenceLog: {
+        divergenceScore: { type: Number, default: 0 },
+        action: { type: String, default: '' },
+        defenseActionTaken: { type: Boolean, default: false },
+        rerunWithCleaned: { type: Boolean, default: false }
+    },
     sanitizedText: { type: String, default: null },
     latencyMs: { type: Number, default: 0 },
     createdAt: { type: Date, default: Date.now },

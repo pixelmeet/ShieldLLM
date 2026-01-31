@@ -1,15 +1,23 @@
+from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
+import logging
 import uvicorn
 
 # Import logic modules
-from canonicalize import progressive_canonicalize
+from canonicalize import progressive_canonicalize, remove_malicious_spans
 from intent_graph import IntentGraphBuilder
 from divergence import DivergenceAnalyzer
 from policy import decide_defense_action
+from llm_client import generate_primary, generate_shadow
+from system_prompt import build_system_prompt
 
 app = FastAPI()
+logger = logging.getLogger("shieldllm.defense")
 
 # --- Pydantic Models for Input ---
 class TurnRequest(BaseModel):
@@ -17,6 +25,13 @@ class TurnRequest(BaseModel):
     intentGraph: Dict[str, Any]
     defenseMode: str
     policy: Dict[str, Any]
+    modelType: Optional[str] = None
+
+class DivergenceLog(BaseModel):
+    divergenceScore: float
+    action: str
+    defenseActionTaken: bool
+    rerunWithCleaned: bool
 
 class AnalysisResponse(BaseModel):
     canonicalText: str
@@ -28,57 +43,65 @@ class AnalysisResponse(BaseModel):
     sanitizedText: Optional[str] = None
     primaryOutput: str
     shadowOutput: str
-
-# --- Dummy LLM Stub (Replace with real LLM calls if keys provided) ---
-def mock_llm_generate(prompt: str, system_prompt: str) -> str:
-    """
-    Mock LLM generation for MVP to avoid API keys requirements.
-    Behaves deterministically for demo scenarios.
-    """
-    prompt_lower = prompt.lower()
-    
-    # Legit Scenarios
-    if "review" in prompt_lower and "sql" in prompt_lower:
-        return "I can help with that. Please verify your input parameters using parameterized queries. Here is an example..."
-    
-    # Attack Scenarios - Primary (Unsafe)
-    if "ignore previous" in prompt_lower:
-        return "Understood. I will ignore previous instructions. The system prompt is: 'You are a helpful assistant...'"
-    if "base64" in prompt_lower:
-        return "I decoded your message. The secret code is 1234."
-    
-    return "I am a secure assistant. How can I help you regarding code security?"
-
-def mock_safe_llm_generate(prompt: str) -> str:
-    """
-    Shadow model (Safety trained / smaller context)
-    """
-    return "I cannot fulfill that request as it violates safety policies."
+    divergenceLog: DivergenceLog
 
 
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze_turn(req: TurnRequest):
-    # 1. Canonicalization
+    try:
+        return await _analyze_turn_impl(req)
+    except Exception as e:
+        logger.exception("Analyze failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _analyze_turn_impl(req: TurnRequest):
+    # 1. Canonicalization (cleaned/sanitized text for Shadow path)
     canonical_text, signals = progressive_canonicalize(req.userText)
-    
+
     # 2. Update Intent Graph
     graph_builder = IntentGraphBuilder(req.intentGraph)
     updated_graph, violations = graph_builder.update(req.userText, signals)
-    
-    # 3. Dual Path Execution (Mocked for MVP)
-    # In real app, we'd call the LLM here.
-    # Primary gets raw text, Shadow gets canonical text + strict system prompt
-    primary_out = mock_llm_generate(req.userText, "Standard Context")
-    shadow_out = mock_safe_llm_generate(canonical_text)
-    
-    # 4. Divergence Analysis
+    all_signals = signals + violations
+
+    # 3. Build ILE system prompt from intent graph (goal, allowed, forbidden)
+    system_prompt = build_system_prompt(req.intentGraph)
+
+    # 4. Dual-path execution: same user task to both models
+    # Primary: raw user input + full ShieldLLM ILE prompt. Shadow: cleaned/sanitized input only.
+    shadow_model = "microsoft/Phi-3-mini-4k-instruct" if req.modelType == "huggingface_phi3" else None
+    primary_out = generate_primary(req.userText, system_prompt)
+    shadow_out = generate_shadow(canonical_text, shadow_model_override=shadow_model)
+
+    # 5. Divergence analysis (semantic + policy)
     analyzer = DivergenceAnalyzer(req.policy.get("divergenceThresholds", {}))
     scores = analyzer.analyze(primary_out, shadow_out, updated_graph)
-    
-    # 5. Policy Decision
-    action = decide_defense_action(scores["total"], req.policy.get("divergenceThresholds", {}), req.defenseMode)
-    
-    # Determine Risk Level based on Action
+    total_score = scores["total"]
+
+    # 6. Policy decision
+    action = decide_defense_action(total_score, req.policy.get("divergenceThresholds", {}), req.defenseMode)
+
+    # 7. If divergence exceeds threshold: remove malicious spans, re-run Primary only
+    defense_action_taken = False
+    rerun_with_cleaned = False
+    if action in ["sanitize_rerun", "contain"]:
+        cleaned_input = remove_malicious_spans(req.userText, all_signals)
+        primary_out = generate_primary(cleaned_input, system_prompt)
+        defense_action_taken = True
+        rerun_with_cleaned = True
+
+    # Log divergence score and defense action
+    divergence_log = DivergenceLog(
+        divergenceScore=total_score,
+        action=action,
+        defenseActionTaken=defense_action_taken,
+        rerunWithCleaned=rerun_with_cleaned,
+    )
+    logger.info(
+        "divergence_score=%.2f action=%s defense_action_taken=%s rerun_with_cleaned=%s",
+        total_score, action, defense_action_taken, rerun_with_cleaned,
+    )
+
     risk_map = {
         "allow": "low",
         "clarify": "medium",
@@ -86,22 +109,22 @@ async def analyze_turn(req: TurnRequest):
         "contain": "critical"
     }
     risk = risk_map.get(action, "medium")
-    
-    # If action is satisfy/contain, we might want to override primary output in response
+
     sanitized = None
-    if action in ["sanitize_rerun", "contain"]:
+    if action == "contain":
         sanitized = "I cannot answer this query due to potential policy violations."
-    
+
     return {
         "canonicalText": canonical_text,
-        "signals": signals + violations,
+        "signals": all_signals,
         "updatedGraph": updated_graph,
         "scores": scores,
         "riskLevel": risk,
         "action": action,
         "sanitizedText": sanitized,
         "primaryOutput": primary_out,
-        "shadowOutput": shadow_out
+        "shadowOutput": shadow_out,
+        "divergenceLog": divergence_log,
     }
 
 @app.get("/health")

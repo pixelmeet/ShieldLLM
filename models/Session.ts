@@ -9,8 +9,8 @@ const SessionSchema = new Schema({
     },
     modelType: {
         type: String,
-        enum: ['gpt_class', 'open_source'],
-        default: 'gpt_class'
+        enum: ['huggingface', 'huggingface_phi3', 'simulated', 'gpt_class', 'open_source'],
+        default: 'huggingface'
     },
     defenseMode: {
         type: String,

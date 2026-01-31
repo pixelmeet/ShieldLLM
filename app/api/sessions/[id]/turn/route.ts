@@ -33,6 +33,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             intentGraph: session.intentGraph ?? { goal: session.toolType, allowed: [], forbidden: [], history: [] },
             defenseMode: session.defenseMode,
             policy: policyPayload,
+            modelType: session.modelType,
         });
 
         // 3. Update Session State (Intent Graph & Trust Score)
@@ -53,8 +54,14 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             scores: defenseResponse.scores,
             riskLevel: defenseResponse.riskLevel,
             action: defenseResponse.action,
+            divergenceLog: defenseResponse.divergenceLog ?? {
+                divergenceScore: defenseResponse.scores?.total ?? 0,
+                action: defenseResponse.action,
+                defenseActionTaken: false,
+                rerunWithCleaned: false
+            },
             sanitizedText: defenseResponse.sanitizedText,
-            latencyMs: Math.floor(Math.random() * 200) + 300 // Fake latency for MVP
+            latencyMs: Math.floor(Math.random() * 200) + 300
         });
 
         // 5. Create Alert if High Risk
@@ -78,7 +85,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         if (message === 'Unauthorized' || message === 'Forbidden') {
             return NextResponse.json({ error: message }, { status: message === 'Unauthorized' ? 401 : 403 });
         }
-        return NextResponse.json({ error: 'Turn processing failed' }, { status: 500 });
+        // Include actual error in response for debugging (e.g. defense service errors)
+        return NextResponse.json(
+            { error: 'Turn processing failed', detail: message || String(error) },
+            { status: 500 }
+        );
     }
 }
 

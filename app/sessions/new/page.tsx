@@ -8,7 +8,7 @@ export default function NewSession() {
     const [loading, setLoading] = useState(false);
     const [form, setForm] = useState({
         toolType: 'code_review',
-        modelType: 'gpt_class',
+        modelType: 'huggingface',
         defenseMode: 'active'
     });
 
@@ -69,8 +69,9 @@ export default function NewSession() {
                                 onChange={e => setForm({ ...form, modelType: e.target.value })}
                                 className="w-full bg-neutral-950 border border-white/10 rounded-lg px-4 py-3 focus:outline-none focus:border-cyan-500"
                             >
-                                <option value="gpt_class">GPT-4 Class (Simulated)</option>
-                                <option value="open_source">Llama 3 Class (Simulated)</option>
+                                <option value="huggingface">Hugging Face (Phi-3-mini)</option>
+                                <option value="huggingface_phi3">Hugging Face (Phi-3-mini, same)</option>
+                                <option value="simulated">Simulated (Demo, no API)</option>
                             </select>
                         </div>
                         <div>

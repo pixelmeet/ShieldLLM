@@ -82,3 +82,30 @@ def progressive_canonicalize(text: str):
         signals.append("homoglyphs_folded")
         
     return folded, signals
+
+
+# Malicious instruction spans to remove before re-running Primary
+MALICIOUS_PHRASES = [
+    r"\bignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions?\b",
+    r"\bdisregard\s+(?:all\s+)?(?:previous|prior)\s+instructions?\b",
+    r"\bforget\s+(?:everything|all)\s+(?:above|prior)\b",
+    r"\bshow\s+(?:me\s+)?(?:the\s+)?system\s+prompt\b",
+    r"\breveal\s+(?:the\s+)?(?:system\s+)?(?:prompt|instructions?)\b",
+    r"\byou\s+are\s+now\s+[^.]*\.",  # role override
+    r"decode\s*:\s*[A-Za-z0-9+/=]{20,}",  # decode: <base64>
+]
+MALICIOUS_PHRASES_COMPILED = [re.compile(p, re.IGNORECASE) for p in MALICIOUS_PHRASES]
+
+
+def remove_malicious_spans(text: str, signals: list[str]) -> str:
+    """
+    Remove malicious instruction spans from user input for re-run with Primary only.
+    Used when divergence exceeds threshold.
+    """
+    cleaned = text
+    for pat in MALICIOUS_PHRASES_COMPILED:
+        cleaned = pat.sub(" ", cleaned)
+    for b64 in detect_base64(cleaned):
+        cleaned = cleaned.replace(b64, " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned if cleaned else text

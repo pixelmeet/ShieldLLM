@@ -73,7 +73,8 @@ export default function SecureChat() {
 
             if (!res.ok) {
                 setTurns(prev => prev.filter(t => t._id !== 'temp'));
-                alert(data?.error ?? 'Turn processing failed');
+                const errMsg = data?.detail ? `${data.error}: ${data.detail}` : (data?.error ?? 'Turn processing failed');
+                alert(errMsg);
                 return;
             }
 

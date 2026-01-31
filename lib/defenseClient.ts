@@ -12,7 +12,14 @@ export async function callDefenseService(endpoint: string, data: any) {
         });
 
         if (!res.ok) {
-            throw new Error(`Defense service error: ${res.statusText}`);
+            let detail = res.statusText;
+            try {
+                const errBody = await res.json();
+                if (errBody?.detail) detail = String(errBody.detail);
+            } catch {
+                // ignore
+            }
+            throw new Error(`Defense service error: ${detail}`);
         }
 
         return await res.json();

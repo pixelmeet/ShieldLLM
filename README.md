@@ -20,7 +20,11 @@ Ensure `.env` is configured (created automatically):
 ```env
 MONGODB_URI=mongodb://localhost:27017/shieldllm
 DEFENSE_SERVICE_URL=http://localhost:8000
+# Optional: for real dual-path LLM inference (Primary: Meta-SecAlign-8B, Shadow: Phi-4 or Phi-3-mini)
+HUGGINGFACE_TOKEN=hf_...
+# Optional: SHADOW_USE_PHI3_MINI=true or SHADOW_MODEL=microsoft/phi-3-mini for limited resources
 ```
+Without `HUGGINGFACE_TOKEN`, the defense service uses built-in mocks for demo.
 
 ### 2. Install Dependencies
 ```bash
