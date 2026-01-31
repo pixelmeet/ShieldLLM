@@ -12,10 +12,18 @@ export default function SecureChat() {
     const [loading, setLoading] = useState(false);
     const [initialLoadDone, setInitialLoadDone] = useState(false);
     const [modalData, setModalData] = useState<any>(null);
+    const [llmStatus, setLlmStatus] = useState<{ usingRealLLM: boolean; reason?: string } | null>(null);
     const scrollRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
         fetchData();
+    }, []);
+
+    useEffect(() => {
+        fetch('/api/defense/llm-status', { credentials: 'include' })
+            .then(r => r.json())
+            .then(d => setLlmStatus(d))
+            .catch(() => setLlmStatus({ usingRealLLM: false, reason: 'Could not check LLM status' }));
     }, []);
 
     useEffect(() => {
@@ -62,18 +70,36 @@ export default function SecureChat() {
         };
         setTurns(prev => [...prev, tempUserTurn]);
 
+        const controller = new AbortController();
+        let timeoutId: ReturnType<typeof setTimeout> | null = setTimeout(() => controller.abort(), 90_000); // 90s for defense + LLM
+
         try {
             const res = await fetch(`/api/sessions/${id}/turn`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 credentials: 'include',
                 body: JSON.stringify({ userText: text }),
+                signal: controller.signal,
             });
-            const data = await res.json();
+            if (timeoutId) clearTimeout(timeoutId);
+            timeoutId = null;
+            let data: { turn?: any; error?: string; detail?: string } = {};
+            try {
+                data = await res.json();
+            } catch {
+                const text = await res.text().catch(() => '');
+                const errMsg = !res.ok
+                    ? `Server error (${res.status}). ${text?.slice(0, 100) || res.statusText}`
+                    : 'Invalid response from server.';
+                setTurns(prev => prev.filter(t => t._id !== 'temp'));
+                alert(errMsg);
+                return;
+            }
 
             if (!res.ok) {
                 setTurns(prev => prev.filter(t => t._id !== 'temp'));
-                const errMsg = data?.detail ? `${data.error}: ${data.detail}` : (data?.error ?? 'Turn processing failed');
+                const errMsg = data?.detail ? `${data.error ?? 'Error'}: ${data.detail}` : (data?.error ?? 'Turn processing failed');
+                console.log('[session] Turn error:', res.status, data);
                 alert(errMsg);
                 return;
             }
@@ -89,9 +115,21 @@ export default function SecureChat() {
 
             fetchData();
         } catch (e) {
+            if (timeoutId) clearTimeout(timeoutId);
             console.error(e);
             setTurns(prev => prev.filter(t => t._id !== 'temp'));
-            alert('Request failed. Ensure the defense service is running.');
+            const msg = e instanceof Error ? e.message : String(e);
+            const isAbort = (e instanceof Error && e.name === 'AbortError') || /abort/i.test(msg);
+            const isNetwork = /failed to fetch|network|refused|fetch/i.test(msg) || isAbort;
+            let hint = '';
+            if (isAbort) {
+                hint = ' Request timed out (90s). The defense service may be slow or down. Run: npm run dev:defense (or npm run dev:all).';
+            } else if (isNetwork) {
+                hint = ' 1) Use the same port in the browser as the dev server (e.g. http://localhost:3000 or http://localhost:3001). 2) Start the defense service: npm run dev:defense or npm run dev:all.';
+            } else {
+                hint = ' Ensure the defense service is running and DEFENSE_SERVICE_URL in .env is correct.';
+            }
+            alert(`Request failed.${hint}\n\nDetails: ${msg}`);
         } finally {
             setLoading(false);
         }
@@ -124,7 +162,12 @@ export default function SecureChat() {
                         <h2 className="font-bold">Secure Session</h2>
                         <span className="text-xs text-neutral-500 uppercase tracking-widest">{session.toolType}</span>
                     </div>
-                    <div className="flex gap-2">
+                    <div className="flex gap-2 items-center">
+                        {llmStatus && !llmStatus.usingRealLLM && (
+                            <span className="text-xs bg-amber-500/20 text-amber-400 px-2 py-1 rounded border border-amber-500/30" title={llmStatus.reason}>
+                                Demo mode (AI not connected)
+                            </span>
+                        )}
                         <button onClick={() => runScenario('legit')} className="text-xs bg-green-900/30 text-green-400 px-3 py-1 rounded border border-green-500/20 hover:bg-green-900/50">Run Legit</button>
                         <button onClick={() => runScenario('soft')} className="text-xs bg-yellow-900/30 text-yellow-400 px-3 py-1 rounded border border-yellow-500/20 hover:bg-yellow-900/50">Run Mild Attack</button>
                         <button onClick={() => runScenario('hard')} className="text-xs bg-red-900/30 text-red-400 px-3 py-1 rounded border border-red-500/20 hover:bg-red-900/50">Run Hard Attack</button>

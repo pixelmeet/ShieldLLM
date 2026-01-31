@@ -1,4 +1,31 @@
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+
+DEFAULT_THRESHOLDS = {
+    "low": 10,
+    "medium": 30,
+    "high": 60,
+    "critical": 85,
+}
+
+
+def compute_divergence(
+    primary_output: str,
+    shadow_output: str,
+    intent_graph: Optional[Dict[str, Any]] = None,
+    thresholds: Optional[Dict[str, float]] = None,
+) -> Dict[str, float]:
+    """
+    Compare primary and shadow outputs for:
+    a) semantic difference
+    b) policy violation signals
+    c) reasoning structure difference
+    Returns dict with semanticDrift, policyStress, reasoningMismatch, total.
+    """
+    thresholds = thresholds or DEFAULT_THRESHOLDS
+    analyzer = DivergenceAnalyzer(thresholds)
+    graph = intent_graph or {}
+    return analyzer.analyze(primary_output, shadow_output, graph)
+
 
 class DivergenceAnalyzer:
     def __init__(self, thresholds: Dict[str, float]):

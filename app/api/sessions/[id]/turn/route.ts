@@ -27,14 +27,39 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
                 defenseModeDefault: 'active',
             };
 
-        // 2. Call Defense Service
-        const defenseResponse = await callDefenseService('/analyze', {
+        // 2. Call Defense Service (with fallback to simulated if OpenAI key/quota fails)
+        const payload = {
             userText,
             intentGraph: session.intentGraph ?? { goal: session.toolType, allowed: [], forbidden: [], history: [] },
             defenseMode: session.defenseMode,
             policy: policyPayload,
             modelType: session.modelType,
-        });
+        };
+
+        let defenseResponse: Awaited<ReturnType<typeof callDefenseService>>;
+        try {
+            defenseResponse = await callDefenseService('/analyze', payload);
+        } catch (firstError: unknown) {
+            const msg = firstError instanceof Error ? firstError.message : String(firstError);
+            const isOpenAIError = /invalid_api_key|incorrect api key|401|insufficient_quota|quota|429/i.test(msg);
+            if (isOpenAIError) {
+                console.log('[turn] OpenAI unavailable, retrying with simulated mode');
+                try {
+                    defenseResponse = await callDefenseService('/analyze', { ...payload, modelType: 'simulated' });
+                } catch (fallbackError) {
+                    console.error('[turn] Simulated fallback failed:', fallbackError);
+                    const hint = /invalid_api_key|401/i.test(msg)
+                        ? 'Set a valid OPENAI_API_KEY in .env or .env.local, or create a new session with Model Backend: "Simulated (Demo, no API)".'
+                        : 'Check your OpenAI plan and billing, or create a new session with Model Backend: "Simulated (Demo, no API)".';
+                    return NextResponse.json(
+                        { error: 'Turn processing failed', detail: hint },
+                        { status: 502 }
+                    );
+                }
+            } else {
+                throw firstError;
+            }
+        }
 
         // 3. Update Session State (Intent Graph & Trust Score)
         session.intentGraph = defenseResponse.updatedGraph;
@@ -80,14 +105,30 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         });
 
     } catch (error: unknown) {
-        console.error(error);
         const message = error instanceof Error ? error.message : '';
+        const detail = message || String(error);
+        console.log('[turn] POST error:', detail);
+        console.error('[turn] Full error:', error);
+
         if (message === 'Unauthorized' || message === 'Forbidden') {
             return NextResponse.json({ error: message }, { status: message === 'Unauthorized' ? 401 : 403 });
         }
-        // Include actual error in response for debugging (e.g. defense service errors)
+
+        // User-friendly message for OpenAI API key / quota errors from defense service
+        const isInvalidKey = /invalid_api_key|incorrect api key|401/i.test(detail);
+        const isQuotaExceeded = /insufficient_quota|quota|429/i.test(detail);
+        if (isInvalidKey || isQuotaExceeded) {
+            const hint = isInvalidKey
+                ? 'Set a valid OPENAI_API_KEY in .env or .env.local (see https://platform.openai.com/account/api-keys), or create a new session with Model Backend: "Simulated (Demo, no API)".'
+                : 'Check your OpenAI plan and billing at https://platform.openai.com/account/billing, or create a new session with Model Backend: "Simulated (Demo, no API)".';
+            return NextResponse.json(
+                { error: 'Turn processing failed', detail: hint },
+                { status: 502 }
+            );
+        }
+
         return NextResponse.json(
-            { error: 'Turn processing failed', detail: message || String(error) },
+            { error: 'Turn processing failed', detail },
             { status: 500 }
         );
     }
@@ -102,6 +143,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
         const turns = await Turn.find({ sessionId }).sort({ createdAt: 1 });
         return NextResponse.json(turns);
     } catch (error) {
+        console.log('[turn] GET error:', error instanceof Error ? error.message : error);
         return NextResponse.json({ error: 'Failed to fetch turns' }, { status: 500 });
     }
 }

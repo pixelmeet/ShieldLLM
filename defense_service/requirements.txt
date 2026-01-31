@@ -7,3 +7,4 @@ pymongo
 requests
 python-multipart
 python-dotenv
+openai>=1.0.0

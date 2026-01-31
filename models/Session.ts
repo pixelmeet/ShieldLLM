@@ -1,5 +1,10 @@
 import mongoose, { Schema, models } from 'mongoose';
 
+// Re-register in dev to pick up schema changes (fixes stale enum after hot reload)
+if (process.env.NODE_ENV === 'development' && models.Session) {
+    delete models.Session;
+}
+
 const SessionSchema = new Schema({
     userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
     toolType: {
@@ -9,8 +14,8 @@ const SessionSchema = new Schema({
     },
     modelType: {
         type: String,
-        enum: ['huggingface', 'huggingface_phi3', 'simulated', 'gpt_class', 'open_source'],
-        default: 'huggingface'
+        enum: ['openai', 'huggingface', 'huggingface_phi3', 'simulated', 'gpt_class', 'open_source'],
+        default: 'openai'
     },
     defenseMode: {
         type: String,

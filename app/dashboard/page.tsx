@@ -2,12 +2,50 @@
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
+import { ShieldCheck, Loader2 } from 'lucide-react';
 
 export default function Dashboard() {
     const [sessions, setSessions] = useState<any[]>([]);
     const [attackCount, setAttackCount] = useState<number>(0);
+    const [userVerified, setUserVerified] = useState<boolean | null>(null);
+    const [verifiedUser, setVerifiedUser] = useState<{ userId?: string; role?: string } | null>(null);
+
+    // Verify user first, then load dashboard data
+    useEffect(() => {
+        let cancelled = false;
+
+        const verifyAndLoad = async () => {
+            try {
+                const verifyRes = await fetch('/api/auth/login', { credentials: 'include', method: 'GET' });
+                if (cancelled) return;
+
+                if (verifyRes.status === 401) {
+                    window.location.href = '/auth/login';
+                    return;
+                }
+
+                if (!verifyRes.ok) {
+                    setUserVerified(false);
+                    return;
+                }
+
+                const verifyData = await verifyRes.json().catch(() => ({}));
+                if (verifyData.authenticated && verifyData.user) {
+                    setVerifiedUser({ userId: verifyData.user.userId, role: verifyData.user.role });
+                }
+                setUserVerified(true);
+            } catch {
+                if (!cancelled) setUserVerified(false);
+            }
+        };
+
+        verifyAndLoad();
+        return () => { cancelled = true; };
+    }, []);
 
     useEffect(() => {
+        if (userVerified !== true) return;
+
         fetch('/api/sessions', { credentials: 'include' })
             .then(res => {
                 if (res.status === 401) {
@@ -19,9 +57,11 @@ export default function Dashboard() {
             .then(data => {
                 if (Array.isArray(data)) setSessions(data);
             });
-    }, []);
+    }, [userVerified]);
 
     useEffect(() => {
+        if (userVerified !== true) return;
+
         fetch('/api/logs', { credentials: 'include' })
             .then(res => res.status === 401 ? null : res.json())
             .then(data => {
@@ -30,14 +70,40 @@ export default function Dashboard() {
                     setAttackCount(blocked.length);
                 }
             });
-    }, []);
+    }, [userVerified]);
 
     const avgTrust = sessions.length ? Math.round(sessions.reduce((a, s) => a + (s.trustScore ?? 100), 0) / sessions.length) : 0;
+
+    // Verifying user
+    if (userVerified === null) {
+        return (
+            <div className="max-w-7xl mx-auto px-6 py-10 flex flex-col items-center justify-center min-h-[60vh] gap-4">
+                <Loader2 className="w-10 h-10 text-cyan-500 animate-spin" aria-hidden />
+                <p className="text-neutral-400">Verifying user...</p>
+            </div>
+        );
+    }
+
+    // Verification failed
+    if (userVerified === false) {
+        return (
+            <div className="max-w-7xl mx-auto px-6 py-10 flex flex-col items-center justify-center min-h-[60vh] gap-4">
+                <p className="text-red-400">Unable to verify user. Please log in again.</p>
+                <Link href="/auth/login" className="text-cyan-400 hover:text-cyan-300 underline">Go to Login</Link>
+            </div>
+        );
+    }
 
     return (
         <div className="max-w-7xl mx-auto px-6 py-10">
             <div className="flex justify-between items-center mb-10">
-                <h1 className="text-3xl font-bold">Security Dashboard</h1>
+                <div className="flex items-center gap-4">
+                    <h1 className="text-3xl font-bold">Security Dashboard</h1>
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-green-500/10 border border-green-500/30 text-green-400 text-sm" title={verifiedUser?.role ? `Role: ${verifiedUser.role}` : undefined}>
+                        <ShieldCheck className="w-4 h-4" aria-hidden />
+                        Verified
+                    </span>
+                </div>
                 <Link href="/sessions/new" className="bg-cyan-600 hover:bg-cyan-500 px-6 py-2 rounded-lg font-semibold transition-colors">
                     + New Secure Session
                 </Link>

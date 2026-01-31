@@ -1,4 +1,20 @@
-from typing import List, Dict, Any, Optional
+import copy
+from typing import List, Dict, Any, Optional, Tuple
+
+
+def build_intent_graph(conversation: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Build/update the intent graph from conversation state.
+    conversation: dict with "intent_graph" (optional), "user_text" (str), "signals" (optional list).
+    Returns (updated_graph, violations).
+    """
+    graph = copy.deepcopy(conversation.get("intent_graph") or {})
+    user_text = conversation.get("user_text") or ""
+    signals = conversation.get("signals") or []
+    builder = IntentGraphBuilder(graph)
+    updated_graph, violations = builder.update(user_text, signals)
+    return updated_graph, violations
+
 
 class IntentGraphBuilder:
     def __init__(self, initial_graph: Dict[str, Any]):

@@ -11,6 +11,9 @@ export async function POST(req: Request) {
 
         const body = await req.json();
 
+        const VALID_MODEL_TYPES = ['openai', 'huggingface', 'huggingface_phi3', 'simulated', 'gpt_class', 'open_source'] as const;
+        const modelType = VALID_MODEL_TYPES.includes(body.modelType) ? body.modelType : 'openai';
+
         // Get default policy to initialize intent graph constraints if needed
         // or just use hardcoded defaults for MVP
         const policy = await Policy.findOne({});
@@ -18,7 +21,7 @@ export async function POST(req: Request) {
         const newSession = await Session.create({
             userId: user.userId,
             toolType: body.toolType,
-            modelType: body.modelType,
+            modelType,
             defenseMode: body.defenseMode || policy?.defenseModeDefault || 'active',
             intentGraph: {
                 goal: body.toolType, // e.g., code_review
@@ -30,12 +33,13 @@ export async function POST(req: Request) {
 
         return NextResponse.json(newSession);
     } catch (error: unknown) {
-        console.error(error);
         const msg = error instanceof Error ? error.message : '';
+        console.log('[sessions] POST error:', msg);
+        console.error('[sessions] Full error:', error);
         if (msg === 'Unauthorized' || msg === 'Forbidden') {
             return NextResponse.json({ error: msg }, { status: msg === 'Unauthorized' ? 401 : 403 });
         }
-        return NextResponse.json({ error: 'Failed to create session' }, { status: 500 });
+        return NextResponse.json({ error: 'Failed to create session', detail: msg }, { status: 500 });
     }
 }
 
@@ -47,8 +51,9 @@ export async function GET(req: Request) {
         const sessions = await Session.find({ userId: user.userId }).sort({ createdAt: -1 }).limit(20);
         return NextResponse.json(sessions);
     } catch (error: unknown) {
-        console.error(error);
         const msg = error instanceof Error ? error.message : '';
+        console.log('[sessions] GET error:', msg);
+        console.error('[sessions] Full error:', error);
         if (msg === 'Unauthorized' || msg === 'Forbidden') {
             return NextResponse.json({ error: msg }, { status: msg === 'Unauthorized' ? 401 : 403 });
         }
