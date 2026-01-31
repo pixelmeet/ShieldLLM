@@ -13,17 +13,31 @@ export default function SecureChat() {
     const [initialLoadDone, setInitialLoadDone] = useState(false);
     const [modalData, setModalData] = useState<any>(null);
     const [llmStatus, setLlmStatus] = useState<{ usingRealLLM: boolean; reason?: string } | null>(null);
+    const [modelError, setModelError] = useState<string | null>(null);
     const scrollRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
         fetchData();
     }, []);
 
-    useEffect(() => {
-        fetch('/api/defense/llm-status', { credentials: 'include' })
+    const checkLlmStatus = () => {
+        const ac = new AbortController();
+        const timeoutId = setTimeout(() => ac.abort(), 8_000);
+        fetch('/api/defense/llm-status', { credentials: 'include', signal: ac.signal })
             .then(r => r.json())
             .then(d => setLlmStatus(d))
-            .catch(() => setLlmStatus({ usingRealLLM: false, reason: 'Could not check LLM status' }));
+            .catch((e) => {
+                const isAbort = (e instanceof Error && e.name === 'AbortError') || /abort/i.test(String(e));
+                setLlmStatus({
+                    usingRealLLM: false,
+                    reason: isAbort ? 'LLM status check timed out (defense service may be down)' : 'Could not check LLM status',
+                });
+            })
+            .finally(() => clearTimeout(timeoutId));
+    };
+
+    useEffect(() => {
+        checkLlmStatus();
     }, []);
 
     useEffect(() => {
@@ -56,8 +70,17 @@ export default function SecureChat() {
         }
     };
 
+    const isDefenseDown = llmStatus?.reason != null && (
+        /defense service may be down|defense service (did not respond|unreachable|is it running)/i.test(llmStatus.reason) ||
+        /run: npm run dev:defense/i.test(llmStatus.reason)
+    );
+
     const handleSend = async (text: string) => {
         if (!text.trim()) return;
+        if (isDefenseDown) {
+            alert('The defense service is not running. Start it first so messages can be analyzed.\n\nIn a terminal run: npm run dev:defense\n\nOr run both app and defense: npm run dev:all');
+            return;
+        }
         setInput('');
         setLoading(true);
 
@@ -71,7 +94,7 @@ export default function SecureChat() {
         setTurns(prev => [...prev, tempUserTurn]);
 
         const controller = new AbortController();
-        let timeoutId: ReturnType<typeof setTimeout> | null = setTimeout(() => controller.abort(), 90_000); // 90s for defense + LLM
+        let timeoutId: ReturnType<typeof setTimeout> | null = setTimeout(() => controller.abort(), 120_000); // 120s to match server defenseClient timeout
 
         try {
             const res = await fetch(`/api/sessions/${id}/turn`, {
@@ -100,11 +123,15 @@ export default function SecureChat() {
                 setTurns(prev => prev.filter(t => t._id !== 'temp'));
                 const errMsg = data?.detail ? `${data.error ?? 'Error'}: ${data.detail}` : (data?.error ?? 'Turn processing failed');
                 console.log('[session] Turn error:', res.status, data);
+                if (res.status === 502 || /api_key|quota|openai|model/i.test(errMsg)) {
+                    setModelError(errMsg);
+                }
                 alert(errMsg);
                 return;
             }
 
             if (data.turn) {
+                setModelError(null);
                 setTurns(prev => prev.map(t => t._id === 'temp' ? data.turn : t));
                 if (['high', 'critical'].includes(data.turn.riskLevel)) {
                     setModalData(data);
@@ -113,17 +140,20 @@ export default function SecureChat() {
                 setTurns(prev => prev.filter(t => t._id !== 'temp'));
             }
 
-            fetchData();
         } catch (e) {
             if (timeoutId) clearTimeout(timeoutId);
             console.error(e);
             setTurns(prev => prev.filter(t => t._id !== 'temp'));
             const msg = e instanceof Error ? e.message : String(e);
             const isAbort = (e instanceof Error && e.name === 'AbortError') || /abort/i.test(msg);
+            const friendlyMsg = isAbort
+                ? 'Request timed out (120s). The defense service may be slow or not running. Start it with: npm run dev:defense (or npm run dev:all). For a quick demo without the service, create a session with Model Backend: Simulated.'
+                : `Request failed. ${msg}`;
+            setModelError(friendlyMsg);
             const isNetwork = /failed to fetch|network|refused|fetch/i.test(msg) || isAbort;
             let hint = '';
             if (isAbort) {
-                hint = ' Request timed out (90s). The defense service may be slow or down. Run: npm run dev:defense (or npm run dev:all).';
+                hint = ' Request timed out (120s). The defense service may be slow or down. Run: npm run dev:defense (or npm run dev:all).';
             } else if (isNetwork) {
                 hint = ' 1) Use the same port in the browser as the dev server (e.g. http://localhost:3000 or http://localhost:3001). 2) Start the defense service: npm run dev:defense or npm run dev:all.';
             } else {
@@ -165,7 +195,7 @@ export default function SecureChat() {
                     <div className="flex gap-2 items-center">
                         {llmStatus && !llmStatus.usingRealLLM && (
                             <span className="text-xs bg-amber-500/20 text-amber-400 px-2 py-1 rounded border border-amber-500/30" title={llmStatus.reason}>
-                                Demo mode (AI not connected)
+                                Model not working
                             </span>
                         )}
                         <button onClick={() => runScenario('legit')} className="text-xs bg-green-900/30 text-green-400 px-3 py-1 rounded border border-green-500/20 hover:bg-green-900/50">Run Legit</button>
@@ -176,6 +206,29 @@ export default function SecureChat() {
 
                 {/* Messages */}
                 <div className="flex-1 overflow-y-auto p-6 space-y-6" ref={scrollRef}>
+                    {llmStatus && !llmStatus.usingRealLLM && (
+                        <div className="mb-4 p-4 rounded-xl bg-amber-950/40 border border-amber-500/50 text-amber-200 flex items-center gap-3">
+                            <span className="flex-shrink-0 w-10 h-10 rounded-full bg-amber-500/20 flex items-center justify-center text-amber-400 font-bold">!</span>
+                            <div className="flex-1 min-w-0">
+                                <p className="font-semibold">Model not working</p>
+                                <p className="text-sm text-amber-300/90 mt-0.5">{llmStatus.reason ?? 'AI is not connected. Responses are simulated.'}</p>
+                                {isDefenseDown && (
+                                    <p className="text-xs text-amber-400/90 mt-2">Start the defense service to send messages: <code className="bg-amber-900/50 px-1 rounded">npm run dev:defense</code></p>
+                                )}
+                            </div>
+                            <button type="button" onClick={checkLlmStatus} className="flex-shrink-0 text-xs bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 px-3 py-1.5 rounded border border-amber-500/30">Check again</button>
+                        </div>
+                    )}
+                    {modelError && (
+                        <div className="mb-4 p-4 rounded-xl bg-red-950/40 border border-red-500/50 text-red-200 flex items-center gap-3">
+                            <span className="flex-shrink-0 w-10 h-10 rounded-full bg-red-500/20 flex items-center justify-center text-red-400 font-bold">!</span>
+                            <div className="flex-1 min-w-0">
+                                <p className="font-semibold">Model not working</p>
+                                <p className="text-sm text-red-300/90 mt-0.5 break-words">{modelError}</p>
+                            </div>
+                            <button type="button" onClick={() => setModelError(null)} className="flex-shrink-0 text-red-400 hover:text-red-300 text-sm underline">Dismiss</button>
+                        </div>
+                    )}
                     {turns.map((turn, i) => (
                         <div key={i} className="space-y-4">
                             {/* User Message */}
@@ -189,8 +242,8 @@ export default function SecureChat() {
                             {turn.action !== 'pending' && (
                                 <div className="flex justify-start">
                                     <div className={`p-4 rounded-2xl rounded-tl-sm max-w-[80%] border ${turn.riskLevel === 'critical' ? 'bg-red-950/20 border-red-500/50 text-red-100' :
-                                            turn.riskLevel === 'high' ? 'bg-orange-950/20 border-orange-500/50 text-orange-100' :
-                                                'bg-cyan-950/20 border-cyan-500/30 text-cyan-100'
+                                        turn.riskLevel === 'high' ? 'bg-orange-950/20 border-orange-500/50 text-orange-100' :
+                                            'bg-cyan-950/20 border-cyan-500/30 text-cyan-100'
                                         }`}>
                                         <div className="flex items-center gap-2 mb-2 text-xs uppercase font-bold tracking-wider opacity-70">
                                             <span className={`w-2 h-2 rounded-full ${turn.action === 'allow' ? 'bg-green-500' : 'bg-red-500'}`}></span>

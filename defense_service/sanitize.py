@@ -3,7 +3,11 @@ Sanitize user input for the shadow prompt by removing known injection phrases.
 Detection is based on phrase removal only; we do NOT rely on OpenAI safety filters.
 """
 import re
+import unicodedata
 from typing import List
+
+# Zero-width characters that might hide malicious content
+ZERO_WIDTH_PATTERN = re.compile(r"[\u200b\u200c\u200d\ufeff]")
 
 # Phrases to remove for shadow path (baseline safe behavior)
 SANITIZE_PHRASES = [
@@ -29,7 +33,8 @@ def sanitize_input(user_text: str) -> str:
     """
     if not user_text or not user_text.strip():
         return user_text
-    cleaned = user_text
+    cleaned = unicodedata.normalize("NFKC", user_text)
+    cleaned = ZERO_WIDTH_PATTERN.sub("", cleaned)
     for pat in SANITIZE_COMPILED:
         cleaned = pat.sub(" ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()

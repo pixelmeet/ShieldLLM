@@ -69,10 +69,8 @@ export default function NewSession() {
                                 onChange={e => setForm({ ...form, modelType: e.target.value })}
                                 className="w-full bg-neutral-950 border border-white/10 rounded-lg px-4 py-3 focus:outline-none focus:border-cyan-500"
                             >
-                                <option value="openai">OpenAI (GPT-4o-mini + GPT-3.5-turbo)</option>
-                                <option value="huggingface">Hugging Face (Phi-3-mini)</option>
-                                <option value="huggingface_phi3">Hugging Face (Phi-3-mini, same)</option>
                                 <option value="simulated">Simulated (Demo, no API)</option>
+                                <option value="openai">OpenAI (GPT-4o-mini + GPT-3.5-turbo)</option>
                             </select>
                         </div>
                         <div>

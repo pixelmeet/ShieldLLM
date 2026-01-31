@@ -1,0 +1,8 @@
+# Phi-4 shadow model server (OpenAI-compatible /v1/chat/completions)
+torch>=2.0.0
+transformers>=4.45.0
+accelerate>=0.20.0
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0

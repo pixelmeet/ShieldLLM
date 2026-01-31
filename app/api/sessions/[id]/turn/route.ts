@@ -8,10 +8,13 @@ import { requireAuth } from '@/lib/auth';
 import { callDefenseService } from '@/lib/defenseClient';
 
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
+    console.log('[turn/POST] ===== NEW TURN REQUEST =====');
     try {
         await requireAuth();
         const { id: sessionId } = await params;
         const { userText } = await req.json();
+        console.log(`[turn/POST] sessionId=${sessionId}, userText length=${userText?.length || 0}`);
+        console.log(`[turn/POST] userText preview: ${userText?.substring(0, 100)}...`);
 
         await dbConnect();
 
@@ -35,13 +38,20 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             policy: policyPayload,
             modelType: session.modelType,
         };
+        console.log(`[turn/POST] Calling defense service with modelType=${session.modelType}, defenseMode=${session.defenseMode}`);
+        console.log(`[turn/POST] Defense service URL: ${process.env.DEFENSE_SERVICE_URL || 'http://localhost:5000'}/analyze`);
 
         let defenseResponse: Awaited<ReturnType<typeof callDefenseService>>;
         try {
+            console.log('[turn/POST] Attempting defense service call...');
             defenseResponse = await callDefenseService('/analyze', payload);
+            console.log('[turn/POST] Defense service call SUCCESS');
+            console.log(`[turn/POST] Response: action=${defenseResponse.action}, riskLevel=${defenseResponse.riskLevel}, divergence=${defenseResponse.divergence_score}`);
         } catch (firstError: unknown) {
             const msg = firstError instanceof Error ? firstError.message : String(firstError);
             const isOpenAIError = /invalid_api_key|incorrect api key|401|insufficient_quota|quota|429/i.test(msg);
+            // Only fall back to simulated for OpenAI key/quota issues. When primary/shadow LLM backends
+            // are down, surface the error so the user knows the models are not working.
             if (isOpenAIError) {
                 console.log('[turn] OpenAI unavailable, retrying with simulated mode');
                 try {
@@ -107,8 +117,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     } catch (error: unknown) {
         const message = error instanceof Error ? error.message : '';
         const detail = message || String(error);
-        console.log('[turn] POST error:', detail);
-        console.error('[turn] Full error:', error);
+        console.log('[turn/POST] ===== ERROR OCCURRED =====');
+        console.log('[turn/POST] Error message:', detail);
+        console.error('[turn/POST] Full error:', error);
+        if (error instanceof Error && error.stack) {
+            console.error('[turn/POST] Stack trace:', error.stack);
+        }
 
         if (message === 'Unauthorized' || message === 'Forbidden') {
             return NextResponse.json({ error: message }, { status: message === 'Unauthorized' ? 401 : 403 });
@@ -127,9 +141,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             );
         }
 
+        // Defense service unreachable, LLM backend down, or timeout -> 502 so UI shows model error hint
+        const isDefenseUnreachable = /defense service|unreachable|econnrefused|fetch failed|timeout|connection|primary or shadow llm/i.test(detail);
+        const status = isDefenseUnreachable ? 502 : 500;
+        const friendlyDetail = isDefenseUnreachable
+            ? (detail.includes('Primary or shadow') ? detail : (detail || 'Defense service or LLM backend unreachable. Run: npm run dev:defense (and start vLLM if using local backends), or create a session with Model Backend: Simulated.'))
+            : detail;
         return NextResponse.json(
-            { error: 'Turn processing failed', detail },
-            { status: 500 }
+            { error: 'Turn processing failed', detail: friendlyDetail },
+            { status }
         );
     }
 }

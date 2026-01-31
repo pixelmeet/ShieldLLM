@@ -19,9 +19,9 @@ export default function Home() {
           <Link href="/auth/login" className="px-8 py-4 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg font-semibold transition-all shadow-lg shadow-cyan-900/20">
             Get Started
           </Link>
-          <Link href="/logs" className="px-8 py-4 bg-white/5 hover:bg-white/10 text-white border border-white/10 rounded-lg font-semibold transition-all">
+          <a href="http://localhost:8501/" target="_blank" rel="noopener noreferrer" className="px-8 py-4 bg-white/5 hover:bg-white/10 text-white border border-white/10 rounded-lg font-semibold transition-all">
             View Demo Attacks
-          </Link>
+          </a>
           <Link href="#how-it-works" className="px-8 py-4 bg-white/5 hover:bg-white/10 text-white border border-white/10 rounded-lg font-semibold transition-all">
             View Architecture
           </Link>

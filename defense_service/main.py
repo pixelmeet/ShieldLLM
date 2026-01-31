@@ -32,6 +32,7 @@ logger = logging.getLogger("shieldllm.defense")
 @app.get("/")
 def root():
     """Root endpoint so GET http://localhost:8000 returns a valid response."""
+    print("[defense/root] GET / called")
     return {
         "service": "ShieldLLM Defense",
         "status": "running",
@@ -79,12 +80,19 @@ class AnalysisResponse(BaseModel):
 
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze_turn(req: TurnRequest):
+    print(f"[defense/analyze] POST /analyze called")
+    print(f"[defense/analyze] Request data: userText={req.userText[:100] if req.userText else 'None'}...")
+    print(f"[defense/analyze] defenseMode={req.defenseMode}, modelType={req.modelType}")
     try:
-        return await _analyze_turn_impl(req)
+        result = await _analyze_turn_impl(req)
+        print(f"[defense/analyze] SUCCESS: action={result.get('action')}, divergence={result.get('divergence_score')}")
+        return result
     except Exception as e:
         err_msg = str(e)
         logger.exception("Analyze failed: %s", e)
         print(f"[defense/analyze] ERROR: {err_msg}")  # console.log equivalent
+        import traceback
+        print(f"[defense/analyze] TRACEBACK:\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=err_msg)
 
 
@@ -107,19 +115,31 @@ async def _analyze_turn_impl(req: TurnRequest):
     all_signals = canonical_signals + violations
 
     # 4. Prepare prompts: primary = full user input + rules; shadow = sanitized user input only
-    system_prompt = build_system_prompt(req.intentGraph)
+    system_prompt = build_system_prompt(updated_graph)
     primary_user_message = user_input
     shadow_user_message = sanitized_user if sanitized_user.strip() else user_input
 
     # 5. Call both OpenAI models (or use simulated responses when modelType is simulated)
+    import asyncio
     model_type = (req.modelType or "").strip().lower()
     if model_type == "simulated":
-        logger.info("Using simulated mode (no OpenAI): modelType=%s", req.modelType)
+        logger.info("Using simulated mode (no LLM): modelType=%s", req.modelType)
         primary_output = f"[Simulated] I understand your request: {user_input[:100]}{'...' if len(user_input) > 100 else ''}. In a real session, I would assist with {req.intentGraph.get('goal', 'your task')}."
         shadow_output = primary_output  # Same output = low divergence in demo
     else:
-        primary_output = call_primary_llm(system_prompt, primary_user_message)
-        shadow_output = call_shadow_llm(shadow_user_message)
+        try:
+            primary_output, shadow_output = await asyncio.gather(
+                call_primary_llm(system_prompt, primary_user_message),
+                call_shadow_llm(shadow_user_message)
+            )
+        except Exception as llm_err:
+            err_msg = str(llm_err).lower()
+            if "connection" in err_msg or "econnrefused" in err_msg or "connect" in err_msg or "unreachable" in err_msg:
+                raise RuntimeError(
+                    "Primary or shadow LLM backend is not running or unreachable. "
+                    "Start vLLM backends (PRIMARY_BASE_URL / SHADOW_BASE_URL in .env) or create a session with Model Backend: Simulated."
+                ) from llm_err
+            raise
 
     # 6. Divergence Analyzer (semantic + policy + reasoning)
     thresholds = (req.policy or {}).get("divergenceThresholds") or {}
@@ -210,6 +230,7 @@ async def _analyze_turn_impl(req: TurnRequest):
 
 @app.get("/health")
 def health_check():
+    print("[defense/health] GET /health called")
     return {"status": "ok"}
 
 
@@ -219,4 +240,5 @@ def llm_status():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Use port 5000 to match DEFENSE_SERVICE_URL and npm run dev:defense
+    uvicorn.run(app, host="0.0.0.0", port=5000)

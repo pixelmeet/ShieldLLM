@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "next dev",
     "dev:3001": "next dev -p 3001",
-    "dev:defense": "cd defense_service && uvicorn main:app --reload --port 8000",
+    "dev:defense": "powershell -Command \"cd defense_service; uvicorn main:app --reload --port 5000\"",
     "dev:all": "concurrently \"npm run dev\" \"npm run dev:defense\"",
     "dev:all:3001": "concurrently \"npm run dev:3001\" \"npm run dev:defense\"",
     "build": "next build",
@@ -70,13 +70,12 @@
     "sonner": "^2.0.7",
     "tailwind-merge": "^3.3.1",
     "tesseract.js": "^6.0.1",
+    "undici": "^7.19.2",
     "uuid": "^13.0.0",
     "vaul": "^1.1.2",
     "zod": "^4.1.5"
   },
   "devDependencies": {
-    "concurrently": "^9.1.2",
-    "dotenv": "^16.4.5",
     "@eslint/eslintrc": "^3",
     "@tailwindcss/postcss": "^4",
     "@types/jsonwebtoken": "^9.0.10",
@@ -84,6 +83,8 @@
     "@types/nodemailer": "^7.0.2",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "concurrently": "^9.1.2",
+    "dotenv": "^16.4.5",
     "eslint": "^9",
     "eslint-config-next": "15.5.2",
     "tailwindcss": "^4",

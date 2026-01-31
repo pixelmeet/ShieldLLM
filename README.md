@@ -43,7 +43,7 @@ npm run seed
 ```
 
 ### 4. Run Application
-You need to run **both** the Next.js frontend and Python defense service.
+You need the Next.js frontend and the Python defense service. For real shadow reasoning with **Phi-4**, also run the shadow server.
 
 **Terminal 1 (Defense Service):**
 ```bash
@@ -51,7 +51,15 @@ cd defense_service
 uvicorn main:app --reload --port 8000
 ```
 
-**Terminal 2 (Frontend):**
+**Terminal 2 (Optional — Phi-4 Shadow):**  
+If `SHADOW_BASE_URL=http://localhost:8001/v1` is set, run the Phi-4 shadow server so the defense service uses it instead of OpenAI for the shadow model:
+```bash
+pip install -r shadow_server/requirements.txt
+python -m shadow_server.main
+# Serves on http://localhost:8001; see shadow_server/README.md
+```
+
+**Terminal 3 (Frontend):**
 ```bash
 npm run dev
 ```
@@ -92,7 +100,20 @@ Visit `http://localhost:3000` to access the console.
 
 ## 📂 Project Structure
 - `/app`: Next.js App Router (Frontend)
-- `/defense_service`: Python FastAPI (Defense Logic)
+- `/backend`: Python FastAPI (ShieldLLM Backend — ILE with vLLM)
+- `/defense_service`: Python FastAPI (Dual-LLM Defense; primary HF/OpenAI, shadow OpenAI or Phi-4 server)
+- `/shadow_server`: Phi-4 shadow model server (transformers, OpenAI-compatible `/v1/chat/completions`)
 - `/lib`: Shared utilities (DB, Auth)
 - `/models`: Mongoose Schemas
 - `/scripts`: Database Seeding
+
+### ShieldLLM Backend (vLLM)
+
+The `/backend` app implements Intent-Locked Execution with dual vLLM endpoints. Run separately:
+
+```bash
+cd backend && pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8100
+```
+
+See `backend/README.md` for setup, env vars, and API examples.
