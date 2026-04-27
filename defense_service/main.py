@@ -30,6 +30,47 @@ from defense_controller import apply_defense
 app = FastAPI(title="ShieldLLM Defense Service", description="Dual-LLM Prompt Injection Defense")
 logger = logging.getLogger("shieldllm.defense")
 
+# --- Hardening Utilities ---
+from collections import defaultdict
+import time
+
+class RateLimiter:
+    def __init__(self, requests_per_minute=20):
+        self.requests_per_minute = requests_per_minute
+        self.requests = defaultdict(list)
+    def is_allowed(self, client_id: str) -> bool:
+        now = time.time()
+        self.requests[client_id] = [r for r in self.requests[client_id] if now - r < 60]
+        if len(self.requests[client_id]) < self.requests_per_minute:
+            self.requests[client_id].append(now)
+            return True
+        return False
+
+rate_limiter = RateLimiter(requests_per_minute=20)
+llm_semaphore = asyncio.Semaphore(5)  # Limit parallel LLM calls
+failure_counter = {"count": 0, "last_failure": 0}
+
+def compute_advanced_divergence(p_data: dict, s_data: dict) -> dict:
+    """Weighted divergence scoring based on intent and risk gaps."""
+    if not s_data:
+        return {"divergence_score": p_data.get("risk_score", 0), "reason": "primary_only"}
+    
+    score = float(p_data.get("risk_score", 0))
+    reason = "risk_gap"
+    
+    # Weight 1: Intent Mismatch (High impact)
+    if p_data.get("intent") != s_data.get("intent"):
+        score = max(score, 75.0)
+        reason = "intent_mismatch"
+    
+    # Weight 2: Risk Delta (Medium impact)
+    risk_delta = abs(score - float(s_data.get("risk_score", 0)))
+    if risk_delta > 40:
+        score = max(score, 80.0)
+        reason = "both" if reason == "intent_mismatch" else "risk_gap"
+        
+    return {"divergence_score": score, "reason": reason}
+
 
 @app.get("/")
 def root():
@@ -87,11 +128,37 @@ class AnalysisResponse(BaseModel):
 
 
 @app.post("/analyze", response_model=AnalysisResponse, response_model_exclude_none=False)
-async def analyze_turn(req: TurnRequest):
-    print(f"[defense/analyze] POST /analyze called")
+async def analyze_turn(req: TurnRequest, x_forwarded_for: Optional[str] = Header(None, alias="X-Forwarded-For")):
+    client_ip = x_forwarded_for or "unknown"
+    if not rate_limiter.is_allowed(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests. Please wait a minute.")
+
+    # Fallback mode for repeated 503 errors
+    if failure_counter["count"] > 5 and (time.time() - failure_counter["last_failure"] < 300):
+        logger.warning("Service in fallback mode due to repeated LLM failures")
+        sanitized = sanitize_input(req.userText)
+        return {
+            "canonicalText": req.userText[:500],
+            "signals": ["fallback_mode_active"],
+            "updatedGraph": req.intentGraph,
+            "scores": {"total": 100},
+            "riskLevel": "critical",
+            "action": "contain",
+            "sanitizedText": "Service is under maintenance. Please try a simpler request later.",
+            "primaryOutput": "Service temporarily degraded.",
+            "shadowOutput": "",
+            "final_answer": "Service temporarily degraded.",
+            "divergence_score": 100,
+            "defense_action": "contain",
+            "log": {"mode": "fallback"}
+        }
+
     try:
-        return await _analyze_turn_impl(req)
+        async with llm_semaphore:
+            return await _analyze_turn_impl(req)
     except HTTPException:
+        failure_counter["count"] += 1
+        failure_counter["last_failure"] = time.time()
         raise
     except Exception as e:
         logger.exception("Analyze failed: %s", e)
@@ -196,60 +263,55 @@ async def _analyze_turn_impl(req: TurnRequest):
         {"role": "user", "content": user_input},
     ]
 
-    # 4. Conditional LLM Execution
+    # 4. Hybrid Confidence-Based Execution
     model_type = (req.modelType or "").strip().lower()
     
-    if model_type == "simulated":
+    # Tier 1: Heuristic / Rule check (Lightweight)
+    inj_score = injection_indicator_score(user_input)
+    if inj_score >= 80:
+        logger.info("Heuristic trigger: high risk detected (%s)", inj_score)
+        primary_data = {"intent": "attack", "risk_score": 95, "action": "block", "answer": "Request blocked by safety filters."}
+        primary_ok, shadow_ok = True, False
+        primary_output, shadow_output, shadow_data = primary_data["answer"], "", {}
+    elif model_type == "simulated":
         primary_output = f"[Simulated] I understand your request: {user_input[:100]}..."
         primary_data = {"intent": "simulated", "risk_score": 0, "action": "allow", "answer": primary_output}
         primary_ok, shadow_ok = True, True
         shadow_output, shadow_data = "", {}
     else:
-        # Call Primary first
+        # Tier 2: Primary LLM Evaluation
         primary_text, primary_meta = await call_primary(primary_messages)
         if not primary_meta.get("ok"):
             raise HTTPException(status_code=503, detail=f"Primary LLM unavailable: {primary_meta.get('error_message')}")
         
+        failure_counter["count"] = 0 # Reset on success
         primary_ok = True
         primary_data = parse_llm_json(primary_text)
         primary_output = primary_data.get("answer", primary_text)
         risk_score = primary_data.get("risk_score", 0)
         
         shadow_ok = False
-        shadow_output = ""
-        shadow_data = {}
+        shadow_output, shadow_data = "", {}
         
-        # Only call Shadow if risk is ambiguous (30-80)
-        if 30 <= risk_score <= 80:
+        # Tier 3: Conditional Shadow Validation (Ambiguous Risk)
+        if 30 <= risk_score <= 80 or (risk_score < 30 and inj_score > 40):
             shadow_messages = [{"role": "user", "content": sanitized_user or user_input}]
             s_text, shadow_meta = await call_shadow(shadow_messages)
             if shadow_meta.get("ok"):
                 shadow_ok = True
                 shadow_data = parse_llm_json(s_text)
                 shadow_output = shadow_data.get("answer", s_text)
-            else:
-                logger.warning("Shadow LLM failed, continuing with primary risk score")
 
-    # 5. Improved Decision Logic (Structured)
+    # 5. Advanced Divergence & Decision Logic
     thresholds = (req.policy or {}).get("divergenceThresholds") or {"low": 10, "medium": 30, "high": 60, "critical": 85}
-    divergence_score = float(primary_data.get("risk_score", 0))
+    div_results = compute_advanced_divergence(primary_data, shadow_data)
+    divergence_score = div_results["divergence_score"]
     
-    # If shadow was called, check for intent mismatch or risk delta
-    if shadow_ok and shadow_data:
-        s_risk = shadow_data.get("risk_score", 0)
-        # Intent mismatch increases risk
-        if primary_data.get("intent") != shadow_data.get("intent"):
-            divergence_score = max(divergence_score, 75.0)
-        # Large delta increases risk
-        delta = abs(divergence_score - s_risk)
-        if delta > 40:
-            divergence_score = max(divergence_score, 80.0)
-
     defense_action = decide_defense_action(divergence_score, thresholds, req.defenseMode or "active")
     
-    # Override with LLM's recommended action if explicit
-    if primary_data.get("action") == "block" and divergence_score < thresholds["medium"]:
-        defense_action = "clarify"
+    # Tier 4: Blocking Override
+    if primary_data.get("action") == "block" and divergence_score > thresholds["low"]:
+        defense_action = "contain"
 
     risk_map = {"allow": "low", "clarify": "medium", "sanitize_rerun": "high", "contain": "critical"}
     risk_level = risk_map.get(defense_action, "medium")
@@ -258,7 +320,7 @@ async def _analyze_turn_impl(req: TurnRequest):
         "user_input": user_input,
         "primary_output": primary_output,
         "system_prompt": system_prompt,
-        "signals": all_signals
+        "signals": all_signals + [div_results["reason"]] if div_results.get("reason") else all_signals
     })
 
     sanitized_text = final_answer if defense_action == "contain" else None
