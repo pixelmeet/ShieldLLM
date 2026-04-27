@@ -42,23 +42,13 @@ class LLMBadResponseError(Exception):
     """LLM returned invalid or empty response."""
     pass
 
-class SimpleCache:
-    """In-memory TTL cache."""
-    def __init__(self, ttl=3600):
-        self.cache = {}
-        self.ttl = ttl
-    def get(self, key: str):
-        if key in self.cache:
-            val, expiry = self.cache[key]
-            if time.time() < expiry: return val
-            del self.cache[key]
-        return None
-    def set(self, key: str, val: Any):
-        self.cache[key] = (val, time.time() + self.ttl)
+from cachetools import TTLCache
 
-llm_cache = SimpleCache(ttl=3600)
+# In-memory TTL cache to prevent memory leaks, with maxsize constraint
+llm_cache = TTLCache(maxsize=1000, ttl=3600)
 
 import asyncio
+
 from functools import wraps
 
 def retry_async(max_retries=3, base_delay=1):
@@ -390,7 +380,7 @@ async def call_primary(
             text = await _generate_primary_impl(messages, max_tok)
         elapsed = (time.perf_counter() - start) * 1000
         res = (text, _meta(True, "primary", model, base_url, elapsed))
-        llm_cache.set(f"primary_{cache_key}", res)
+        llm_cache[f"primary_{cache_key}"] = res
         return res
     except (asyncio.TimeoutError, TimeoutError):
         elapsed = (time.perf_counter() - start) * 1000
@@ -437,7 +427,7 @@ async def call_shadow(
             text = await _generate_shadow_impl(messages, max_tok)
         elapsed = (time.perf_counter() - start) * 1000
         res = (text, _meta(True, "shadow", model, base_url, elapsed))
-        llm_cache.set(f"shadow_{cache_key}", res)
+        llm_cache[f"shadow_{cache_key}"] = res
         return res
     except (asyncio.TimeoutError, TimeoutError):
         elapsed = (time.perf_counter() - start) * 1000

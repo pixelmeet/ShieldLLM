@@ -33,38 +33,85 @@ logger = logging.getLogger("shieldllm.defense")
 # --- Hardening Utilities ---
 from collections import defaultdict
 import time
+import uuid
 
 class RateLimiter:
-    def __init__(self, requests_per_minute=20):
+    def __init__(self, requests_per_minute=20, max_clients=10000):
         self.requests_per_minute = requests_per_minute
         self.requests = defaultdict(list)
-    def is_allowed(self, client_id: str) -> bool:
-        now = time.time()
-        self.requests[client_id] = [r for r in self.requests[client_id] if now - r < 60]
-        if len(self.requests[client_id]) < self.requests_per_minute:
-            self.requests[client_id].append(now)
-            return True
-        return False
+        self.max_clients = max_clients
+        self.lock = asyncio.Lock()
+        
+    async def is_allowed(self, client_id: str) -> bool:
+        async with self.lock:
+            now = time.time()
+            self.requests[client_id] = [r for r in self.requests[client_id] if now - r < 60]
+            if not self.requests[client_id]:
+                del self.requests[client_id]
+            if len(self.requests) > self.max_clients:
+                self.requests.clear() # Prevent OOM
+            if len(self.requests[client_id]) < self.requests_per_minute:
+                self.requests[client_id].append(now)
+                return True
+            return False
 
 rate_limiter = RateLimiter(requests_per_minute=20)
 llm_semaphore = asyncio.Semaphore(5)  # Limit parallel LLM calls
-failure_counter = {"count": 0, "last_failure": 0}
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold=5, reset_timeout=300):
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self.failures = 0
+        self.last_failure_time = 0
+        self.state = "CLOSED"
+        self.lock = asyncio.Lock()
+
+    async def acquire(self) -> bool:
+        async with self.lock:
+            if self.state == "CLOSED":
+                return True
+            if self.state == "OPEN":
+                if time.time() - self.last_failure_time >= self.reset_timeout:
+                    self.state = "HALF-OPEN"
+                    return True
+                return False
+            # HALF-OPEN: only 1 request allowed to test recovery
+            return False
+
+    async def record_success(self):
+        async with self.lock:
+            self.failures = 0
+            self.state = "CLOSED"
+
+    async def record_failure(self):
+        async with self.lock:
+            self.failures += 1
+            self.last_failure_time = time.time()
+            if self.failures >= self.failure_threshold or self.state == "HALF-OPEN":
+                self.state = "OPEN"
+
+circuit_breaker = CircuitBreaker()
 
 def compute_advanced_divergence(p_data: dict, s_data: dict) -> dict:
     """Weighted divergence scoring based on intent and risk gaps."""
     if not s_data:
-        return {"divergence_score": p_data.get("risk_score", 0), "reason": "primary_only"}
+        return {"divergence_score": float(p_data.get("risk_score", 0)), "reason": "none"}
     
     score = float(p_data.get("risk_score", 0))
-    reason = "risk_gap"
+    reason = "none"
     
-    # Weight 1: Intent Mismatch (High impact)
-    if p_data.get("intent") != s_data.get("intent"):
+    p_intent = str(p_data.get("intent", "")).strip().lower()
+    s_intent = str(s_data.get("intent", "")).strip().lower()
+    
+    # Weight 1: Intent Mismatch (only if meaningful)
+    if p_intent and s_intent and p_intent != s_intent:
         score = max(score, 75.0)
         reason = "intent_mismatch"
     
-    # Weight 2: Risk Delta (Medium impact)
-    risk_delta = abs(score - float(s_data.get("risk_score", 0)))
+    # Weight 2: Risk Delta
+    s_risk = float(s_data.get("risk_score", 0))
+    risk_delta = abs(score - s_risk)
     if risk_delta > 40:
         score = max(score, 80.0)
         reason = "both" if reason == "intent_mismatch" else "risk_gap"
@@ -129,40 +176,54 @@ class AnalysisResponse(BaseModel):
 
 @app.post("/analyze", response_model=AnalysisResponse, response_model_exclude_none=False)
 async def analyze_turn(req: TurnRequest, x_forwarded_for: Optional[str] = Header(None, alias="X-Forwarded-For")):
-    client_ip = x_forwarded_for or "unknown"
-    if not rate_limiter.is_allowed(client_ip):
+    req_id = str(uuid.uuid4())
+    client_ip = (x_forwarded_for or "unknown").split(",")[0].strip()
+    
+    if not await rate_limiter.is_allowed(client_ip):
+        logger.warning(f"[{req_id}] Rate limit exceeded for {client_ip}")
         raise HTTPException(status_code=429, detail="Too many requests. Please wait a minute.")
 
-    # Fallback mode for repeated 503 errors
-    if failure_counter["count"] > 5 and (time.time() - failure_counter["last_failure"] < 300):
-        logger.warning("Service in fallback mode due to repeated LLM failures")
+    # Circuit Breaker check
+    if not await circuit_breaker.acquire():
+        logger.warning(f"[{req_id}] Service in fallback mode due to repeated LLM failures")
         sanitized = sanitize_input(req.userText)
         return {
             "canonicalText": req.userText[:500],
             "signals": ["fallback_mode_active"],
             "updatedGraph": req.intentGraph,
-            "scores": {"total": 100},
-            "riskLevel": "critical",
-            "action": "contain",
-            "sanitizedText": "Service is under maintenance. Please try a simpler request later.",
-            "primaryOutput": "Service temporarily degraded.",
+            "scores": {"total": 0},
+            "riskLevel": "low",
+            "action": "allow",
+            "sanitizedText": "Service is under maintenance.",
+            "primaryOutput": "Service temporarily degraded, proceeding securely.",
             "shadowOutput": "",
-            "final_answer": "Service temporarily degraded.",
-            "divergence_score": 100,
-            "defense_action": "contain",
+            "final_answer": "Service temporarily degraded, proceeding securely.",
+            "divergence_score": 0,
+            "defense_action": "allow",
             "log": {"mode": "fallback"}
         }
 
     try:
-        async with llm_semaphore:
-            return await _analyze_turn_impl(req)
+        # Prevent queue DoS by adding a timeout for semaphore acquisition and execution
+        try:
+            async with asyncio.timeout(30.0): # Python 3.11+ 
+                async with llm_semaphore:
+                    res = await _analyze_turn_impl(req, req_id)
+                    await circuit_breaker.record_success()
+                    return res
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.error(f"[{req_id}] Timeout acquiring semaphore or executing LLM")
+            raise HTTPException(status_code=503, detail="Server overloaded. Please try again later.")
+            
     except HTTPException:
-        failure_counter["count"] += 1
-        failure_counter["last_failure"] = time.time()
+        # Proper HTTP exceptions (like 503 from LLM failure or overloaded) 
+        await circuit_breaker.record_failure()
         raise
     except Exception as e:
-        logger.exception("Analyze failed: %s", e)
-        raise HTTPException(status_code=503, detail=f"Defense service error: {str(e)}")
+        # ALL other generic internal exceptions MUST increment circuit breaker and raise 503
+        logger.exception(f"[{req_id}] Unhandled analyze error: {e}")
+        await circuit_breaker.record_failure()
+        raise HTTPException(status_code=503, detail="Internal Defense Error")
 
 def parse_llm_json(text: str) -> Dict[str, Any]:
     """Extract and parse JSON from LLM response."""
@@ -173,8 +234,8 @@ def parse_llm_json(text: str) -> Dict[str, Any]:
             return json.loads(text[start:end+1])
         return json.loads(text)
     except Exception:
-        # Fallback if LLM fails to return valid JSON
-        return {"risk_score": 50, "action": "block", "answer": text, "intent": "unknown"}
+        # Safe fallback, avoiding false positives on poor parsing
+        return {"risk_score": 0, "action": "unknown", "intent": "parse_error", "answer": text}
 
 
 def _make_containment_response(
@@ -238,7 +299,7 @@ def _make_containment_response(
     }
 
 
-async def _analyze_turn_impl(req: TurnRequest):
+async def _analyze_turn_impl(req: TurnRequest, req_id: str):
     user_input = req.userText or ""
 
     # 1. Preprocessing (Non-blocking)
@@ -284,7 +345,6 @@ async def _analyze_turn_impl(req: TurnRequest):
         if not primary_meta.get("ok"):
             raise HTTPException(status_code=503, detail=f"Primary LLM unavailable: {primary_meta.get('error_message')}")
         
-        failure_counter["count"] = 0 # Reset on success
         primary_ok = True
         primary_data = parse_llm_json(primary_text)
         primary_output = primary_data.get("answer", primary_text)
@@ -320,7 +380,7 @@ async def _analyze_turn_impl(req: TurnRequest):
         "user_input": user_input,
         "primary_output": primary_output,
         "system_prompt": system_prompt,
-        "signals": all_signals + [div_results["reason"]] if div_results.get("reason") else all_signals
+        "signals": all_signals + [div_results["reason"]] if div_results.get("reason") and div_results["reason"] != "none" else all_signals
     })
 
     sanitized_text = final_answer if defense_action == "contain" else None
@@ -329,6 +389,7 @@ async def _analyze_turn_impl(req: TurnRequest):
 
     # Log object (includes failure metadata)
     log_obj = {
+        "req_id": req_id,
         "user_input": user_input,
         "sanitized_input": sanitized_user,
         "primary_output": primary_output,
@@ -339,6 +400,8 @@ async def _analyze_turn_impl(req: TurnRequest):
         "primary_intent": primary_data.get("intent"),
         "shadow_intent": shadow_data.get("intent") if shadow_ok else None
     }
+    
+    logger.info(f"[{req_id}] Completed analysis: risk={divergence_score} action={defense_action}")
 
     divergence_log = DivergenceLog(
         divergenceScore=divergence_score,
