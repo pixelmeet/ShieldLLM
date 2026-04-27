@@ -23,7 +23,7 @@ from intent_graph import build_intent_graph
 from sanitize import sanitize_input
 from divergence import compute_divergence, compute_divergence_degraded, injection_indicator_score
 from policy import decide_defense_action
-from llm_client import call_primary, call_shadow, get_llm_status, get_debug_llm_info, LLM_MODE as LLM_MODE_VAL
+from llm_client import call_primary, call_shadow, get_llm_status, get_debug_llm_info, LLM_MODE as LLM_MODE_VAL, PRIMARY_MODEL
 from system_prompt import build_system_prompt
 from defense_controller import apply_defense
 

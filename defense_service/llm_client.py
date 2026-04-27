@@ -168,7 +168,7 @@ def _get_cloud_client(model_type: str, requested_model: str):
         api_key = os.environ.get("GROQ_API_KEY", "").strip()
         base_url = "https://api.groq.com/openai/v1"
         provider = "groq"
-        model = "llama3-8b-8192" # Enforce Groq model
+        model = "llama-3.1-8b-instant" # Fast Groq model
     elif model_type == "openai":
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()
         base_url = "https://api.openai.com/v1"
