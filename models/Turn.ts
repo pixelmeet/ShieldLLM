@@ -13,12 +13,12 @@ const TurnSchema = new Schema({
     },
     riskLevel: {
         type: String,
-        enum: ['low', 'medium', 'high', 'critical'],
+        enum: ['low', 'medium', 'high', 'critical', 'unknown'],
         default: 'low'
     },
     action: {
         type: String,
-        enum: ['allow', 'clarify', 'sanitize_rerun', 'contain'],
+        enum: ['allow', 'clarify', 'sanitize_rerun', 'contain', 'unverified'],
         default: 'allow'
     },
     divergenceLog: {

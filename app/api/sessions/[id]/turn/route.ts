@@ -75,7 +75,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         session.intentGraph = defenseResponse.updatedGraph;
 
         // Simple trust score decay logic
-        if ((defenseResponse.scores?.total ?? 0) > 20) {
+        if (defenseResponse.action !== 'unverified' && (defenseResponse.scores?.total ?? 0) > 20) {
             session.trustScore = Math.max(0, session.trustScore - ((defenseResponse.scores?.total ?? 0) / 5));
         }
         await session.save();
