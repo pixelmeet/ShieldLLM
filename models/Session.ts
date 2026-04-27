@@ -14,8 +14,8 @@ const SessionSchema = new Schema({
     },
     modelType: {
         type: String,
-        enum: ['openai', 'huggingface', 'huggingface_phi3', 'simulated', 'gpt_class', 'open_source'],
-        default: 'openai'
+        enum: ['openai', 'groq', 'huggingface', 'huggingface_phi3', 'simulated', 'gpt_class', 'open_source'],
+        default: 'groq'
     },
     defenseMode: {
         type: String,

@@ -11,8 +11,8 @@ export async function POST(req: Request) {
 
         const body = await req.json();
 
-        const VALID_MODEL_TYPES = ['openai', 'huggingface', 'huggingface_phi3', 'simulated', 'gpt_class', 'open_source'] as const;
-        const modelType = VALID_MODEL_TYPES.includes(body.modelType) ? body.modelType : 'openai';
+        const VALID_MODEL_TYPES = ['openai', 'groq', 'huggingface', 'huggingface_phi3', 'simulated', 'gpt_class', 'open_source'] as const;
+        const modelType = VALID_MODEL_TYPES.includes(body.modelType) ? body.modelType : 'groq';
 
         // Get default policy to initialize intent graph constraints if needed
         // or just use hardcoded defaults for MVP

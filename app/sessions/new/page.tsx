@@ -8,7 +8,7 @@ export default function NewSession() {
     const [loading, setLoading] = useState(false);
     const [form, setForm] = useState({
         toolType: 'code_review',
-        modelType: 'simulated',
+        modelType: 'groq',
         defenseMode: 'active'
     });
 
@@ -70,7 +70,8 @@ export default function NewSession() {
                                 className="w-full bg-neutral-950 border border-white/10 rounded-lg px-4 py-3 focus:outline-none focus:border-cyan-500"
                             >
                                 <option value="simulated">Simulated (Demo, no API)</option>
-                                <option value="openai">OpenAI (main chatbot + shadow via API)</option>
+                                <option value="groq">Groq (Llama 3 API)</option>
+                                <option value="openai">OpenAI (GPT API)</option>
                             </select>
                         </div>
                         <div>

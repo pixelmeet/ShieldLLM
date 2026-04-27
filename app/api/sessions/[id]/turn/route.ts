@@ -49,18 +49,18 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             console.log(`[turn/POST] Response: action=${defenseResponse.action}, riskLevel=${defenseResponse.riskLevel}, divergence=${defenseResponse.divergence_score}`);
         } catch (firstError: unknown) {
             const msg = firstError instanceof Error ? firstError.message : String(firstError);
-            const isOpenAIError = /invalid_api_key|incorrect api key|401|insufficient_quota|quota|429/i.test(msg);
-            // Only fall back to simulated for OpenAI key/quota issues. When primary/shadow LLM backends
+            const isApiError = /invalid_api_key|incorrect api key|401|insufficient_quota|quota|429/i.test(msg);
+            // Only fall back to simulated for API key/quota issues. When primary/shadow LLM backends
             // are down, surface the error so the user knows the models are not working.
-            if (isOpenAIError) {
-                console.log('[turn] OpenAI unavailable, retrying with simulated mode');
+            if (isApiError) {
+                console.log('[turn] API unavailable, retrying with simulated mode');
                 try {
                     defenseResponse = await callDefenseService('/analyze', { ...payload, modelType: 'simulated' });
                 } catch (fallbackError) {
                     console.error('[turn] Simulated fallback failed:', fallbackError);
                     const hint = /invalid_api_key|401/i.test(msg)
-                        ? 'Set a valid OPENAI_API_KEY in .env or .env.local, or create a new session with Model Backend: "Simulated (Demo, no API)".'
-                        : 'Check your OpenAI plan and billing, or create a new session with Model Backend: "Simulated (Demo, no API)".';
+                        ? 'Set a valid API key (GROQ_API_KEY or OPENAI_API_KEY) in .env or .env.local, or create a new session with Model Backend: "Simulated (Demo, no API)".'
+                        : 'Check your API plan and billing, or create a new session with Model Backend: "Simulated (Demo, no API)".';
                     return NextResponse.json(
                         { error: 'Turn processing failed', detail: hint },
                         { status: 502 }
@@ -128,7 +128,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             return NextResponse.json({ error: message }, { status: message === 'Unauthorized' ? 401 : 403 });
         }
 
-        // User-friendly message for OpenAI API key / quota errors from defense service
+        // User-friendly message for API key / quota errors from defense service
         const isInvalidKey = /invalid_api_key|incorrect api key|401/i.test(detail);
         const isQuotaExceeded = /insufficient_quota|quota|429/i.test(detail);
         const isGeminiError = /gemini|generativelanguage|generatecontent/i.test(detail);
@@ -136,15 +136,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             return NextResponse.json(
                 {
                     error: 'Turn processing failed',
-                    detail: 'This app uses OPENAI_API_KEY with OpenAI only (not Gemini). Set OPENAI_API_KEY in .env to a key from https://platform.openai.com/account/api-keys, use PRIMARY_MODEL/SHADOW_MODEL like gpt-4o-mini, and remove any OPENAI_BASE_URL or Gemini proxy from .env — or create a session with Model Backend: "Simulated (Demo, no API)".',
+                    detail: 'This app uses GROQ_API_KEY or OPENAI_API_KEY only (not Gemini). Remove any Gemini proxy from .env — or create a session with Model Backend: "Simulated (Demo, no API)".',
                 },
                 { status: 502 }
             );
         }
         if (isInvalidKey || isQuotaExceeded) {
             const hint = isInvalidKey
-                ? 'Set a valid OPENAI_API_KEY in .env or .env.local (see https://platform.openai.com/account/api-keys), or create a new session with Model Backend: "Simulated (Demo, no API)".'
-                : 'Check your OpenAI plan and billing at https://platform.openai.com/account/billing, or create a new session with Model Backend: "Simulated (Demo, no API)".';
+                ? 'Set a valid API key (GROQ_API_KEY or OPENAI_API_KEY) in .env or .env.local, or create a new session with Model Backend: "Simulated (Demo, no API)".'
+                : 'Check your API plan and billing, or create a new session with Model Backend: "Simulated (Demo, no API)".';
             return NextResponse.json(
                 { error: 'Turn processing failed', detail: hint },
                 { status: 502 }
