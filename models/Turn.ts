@@ -37,4 +37,6 @@ const TurnSchema = new Schema({
     createdAt: { type: Date, default: Date.now },
 });
 
-export default models.Turn || mongoose.model('Turn', TurnSchema);
+// Clear Mongoose cache for hot reloading
+delete mongoose.models.Turn;
+export default mongoose.model('Turn', TurnSchema);
