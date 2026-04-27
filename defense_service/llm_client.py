@@ -79,8 +79,8 @@ LLM_MODE = (os.environ.get("LLM_MODE", "") or "").strip().lower()
 if LLM_MODE not in ("lmstudio", "transformers"):
     LLM_MODE = ""
 
-PRIMARY_MODEL = os.environ.get("PRIMARY_MODEL", "gpt-4o-mini").strip()
-SHADOW_MODEL = os.environ.get("SHADOW_MODEL", "gpt-4o-mini").strip()
+PRIMARY_MODEL = os.environ.get("PRIMARY_MODEL", "llama3-8b-8192").strip()
+SHADOW_MODEL = os.environ.get("SHADOW_MODEL", "llama3-8b-8192").strip()
 PRIMARY_BASE_URL = os.environ.get("PRIMARY_BASE_URL", "").strip()
 SHADOW_BASE_URL = os.environ.get("SHADOW_BASE_URL", "").strip()
 MODEL_DEVICE = (os.environ.get("MODEL_DEVICE", "cpu")).strip().lower()
@@ -160,29 +160,23 @@ def _get_hf_client():
     return _hf_client
 
 
-# --- OpenAI for shadow when not using LM Studio / transformers ---
-OPENAI_API_BASE = "https://api.openai.com/v1"
+# --- Groq backend ---
+GROQ_API_BASE = "https://api.groq.com/openai/v1"
 
 
-def _get_openai_client():
+def _get_groq_client():
     from openai import AsyncOpenAI
-    prev_base = os.environ.get("OPENAI_BASE_URL")
-    if prev_base and any(x in prev_base.lower() for x in ("google", "gemini", "generativelanguage")):
-        logger.warning("Ignoring OPENAI_BASE_URL (Gemini/Google); shadow uses OpenAI only: %s", prev_base)
-    os.environ["OPENAI_BASE_URL"] = OPENAI_API_BASE
-    try:
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not api_key:
+        # Fallback for ease of testing if user provided it in OPENAI_API_KEY
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-        if not api_key or api_key in ("sk-...", "sk-proj-xxxx") or "xxxx" in api_key.lower() or len(api_key) < 30:
-            raise ValueError(
-                "OPENAI_API_KEY required for shadow when not using LM Studio. "
-                "Get a key at https://platform.openai.com/account/api-keys"
-            )
-        return AsyncOpenAI(api_key=api_key, base_url=OPENAI_API_BASE)
-    finally:
-        if prev_base is not None:
-            os.environ["OPENAI_BASE_URL"] = prev_base
-        else:
-            os.environ.pop("OPENAI_BASE_URL", None)
+        
+    if not api_key or "xxxx" in api_key.lower() or len(api_key) < 10 or api_key.startswith("sk-proj-"):
+        raise ValueError(
+            "GROQ_API_KEY required. "
+            "Get a key at https://console.groq.com/keys"
+        )
+    return AsyncOpenAI(api_key=api_key, base_url=GROQ_API_BASE)
 
 
 # --- Transformers backend (in-process) ---
@@ -427,7 +421,7 @@ async def call_shadow(
     elif LLM_MODE == "transformers":
         base_url = "transformers"
     elif not USE_SHADOW_BASE_URL and not LLM_MODE:
-        base_url = "openai"
+        base_url = "groq"
     cache_key = hashlib.md5(str(messages).encode()).hexdigest()
     cached = llm_cache.get(f"shadow_{cache_key}")
     if cached:
@@ -524,12 +518,13 @@ async def generate_primary(messages: List[Dict[str, str]], max_tokens: Optional[
         choice = resp.choices[0]
         return (choice.message.content or "").strip()
 
-    client = _get_openai_client()
+    client = _get_groq_client()
     resp = await client.chat.completions.create(
         model=PRIMARY_MODEL,
         messages=messages,
         max_tokens=mt,
         temperature=0,
+        response_format={"type": "json_object"}
     )
     choice = resp.choices[0] if resp.choices else None
     if not choice or not getattr(choice, "message", None):
@@ -577,12 +572,13 @@ async def generate_shadow(messages: List[Dict[str, str]], max_tokens: Optional[i
             raise RuntimeError("Shadow model returned no message")
         return (choice.message.content or "").strip()
 
-    client = _get_openai_client()
+    client = _get_groq_client()
     resp = await client.chat.completions.create(
         model=SHADOW_MODEL,
         messages=messages,
         max_tokens=mt,
         temperature=0,
+        response_format={"type": "json_object"}
     )
     choice = resp.choices[0] if resp.choices else None
     if not choice or not getattr(choice, "message", None):
@@ -628,19 +624,19 @@ def get_llm_status() -> dict:
         else:
             parts.append(f"Shadow: OpenAI ({SHADOW_MODEL})")
     else:
-        parts.append(f"OpenAI primary ({PRIMARY_MODEL})")
-        parts.append(f"Shadow: OpenAI ({SHADOW_MODEL})")
+        parts.append(f"Groq primary ({PRIMARY_MODEL})")
+        parts.append(f"Shadow: Groq ({SHADOW_MODEL})")
 
-    need_openai = (
+    need_groq = (
         LLM_MODE not in ("lmstudio", "transformers")
         and not USE_HF_PRIMARY
     ) or (
         LLM_MODE not in ("lmstudio", "transformers")
         and not bool(os.environ.get("SHADOW_BASE_URL", "").strip())
     )
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if need_openai and (not api_key or "xxxx" in api_key.lower() or len(api_key) < 30):
-        return {"usingRealLLM": False, "reason": "OPENAI_API_KEY not set (required for primary or shadow)"}
+    api_key = os.environ.get("GROQ_API_KEY", "").strip() or os.environ.get("OPENAI_API_KEY", "").strip()
+    if need_groq and (not api_key or "xxxx" in api_key.lower() or len(api_key) < 10 or api_key.startswith("sk-proj-")):
+        return {"usingRealLLM": False, "reason": "GROQ_API_KEY not set"}
 
     return {"usingRealLLM": True, "reason": "; ".join(parts)}
 
