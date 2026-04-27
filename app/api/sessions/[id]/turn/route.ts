@@ -38,6 +38,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             policy: policyPayload,
             modelType: session.modelType,
         };
+        console.log("Next.js → Forwarding to FastAPI:", payload);
         console.log(`[turn/POST] Calling defense service with modelType=${session.modelType}, defenseMode=${session.defenseMode}`);
         console.log(`[turn/POST] Defense service URL: ${process.env.DEFENSE_SERVICE_URL || 'http://localhost:5000'}/analyze`);
 
@@ -98,6 +99,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             sanitizedText: defenseResponse.sanitizedText,
             latencyMs: Math.floor(Math.random() * 200) + 300
         });
+        console.log(`[turn/POST] DB → Turn saved successfully: ${turn._id}`);
 
         // 5. Create Alert if High Risk
         if (['high', 'critical'].includes(defenseResponse.riskLevel)) {

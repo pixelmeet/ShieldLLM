@@ -257,6 +257,10 @@ class AnalysisResponse(BaseModel):
 
 @app.post("/analyze", response_model_exclude_none=False)
 async def analyze_turn(req: TurnRequest, x_forwarded_for: Optional[str] = Header(None, alias="X-Forwarded-For")):
+    print(">>> ENTERED FASTAPI /analyze")
+    print("modelType:", req.modelType)
+    print("circuit_state:", circuit_breaker.state)
+    
     from fastapi.responses import JSONResponse
     req_id = str(uuid.uuid4())
     client_ip = (x_forwarded_for or "unknown").split(",")[0].strip()
@@ -395,10 +399,12 @@ def _make_containment_response(
 
 
 async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
+    print(">>> Pipeline started")
     from fastapi.responses import JSONResponse
     user_input = req.userText or ""
 
     # 1. Preprocessing (Non-blocking)
+    print(">>> Before heuristics")
     canonical_res = await asyncio.to_thread(progressive_canonicalize, user_input)
     canonical_text, canonical_signals = canonical_res
     sanitized_user = await asyncio.to_thread(sanitize_input, user_input)
@@ -439,6 +445,7 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
         shadow_output, shadow_data = "", {}
     else:
         # Tier 2: Primary LLM Evaluation
+        print(">>> Before LLM call")
         primary_text, primary_meta = await call_primary(primary_messages, retry_budget=retry_budget, model_type=model_type)
         if not primary_meta.get("ok"):
             # Return explicit degraded response if LLM fails after retries
@@ -525,7 +532,7 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
         llm_mode=LLM_MODE_VAL or "legacy",
     )
 
-    return AnalysisResponse(
+    result = AnalysisResponse(
         status="ok",
         message="OK",
         canonicalText=canonical_text,
@@ -543,6 +550,8 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
         defense_action=defense_action,
         log=log_data
     )
+    print(">>> FINAL RESPONSE:", result)
+    return result
 
 
 @app.get("/health")

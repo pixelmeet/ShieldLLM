@@ -97,6 +97,13 @@ export default function SecureChat() {
         let timeoutId: ReturnType<typeof setTimeout> | null = setTimeout(() => controller.abort(), 120_000); // 120s to match server defenseClient timeout
 
         try {
+            const payload = {
+                userText: text,
+                modelType: session.modelType,
+                defenseMode: session.defenseMode
+            };
+            console.log("UI → Sending request:", payload);
+
             const res = await fetch(`/api/sessions/${id}/turn`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },

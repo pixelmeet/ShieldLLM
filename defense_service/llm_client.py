@@ -528,6 +528,9 @@ async def generate_primary(messages: List[Dict[str, str]], max_tokens: Optional[
         return (choice.message.content or "").strip(), "huggingface", PRIMARY_MODEL, "huggingface"
 
     client, provider, base_url, used_model = _get_cloud_client(model_type, PRIMARY_MODEL)
+    print(">>> CALLING GROQ LLM")
+    print("model:", used_model)
+    print("base_url:", base_url)
     resp = await client.chat.completions.create(
         model=used_model,
         messages=messages,
@@ -538,7 +541,9 @@ async def generate_primary(messages: List[Dict[str, str]], max_tokens: Optional[
     choice = resp.choices[0] if resp.choices else None
     if not choice or not getattr(choice, "message", None):
         raise RuntimeError("Primary model returned no message")
-    return (choice.message.content or "").strip(), provider, used_model, base_url
+    response = (choice.message.content or "").strip()
+    print(">>> LLM RAW RESPONSE:", response)
+    return response, provider, used_model, base_url
 
 
 async def generate_shadow(messages: List[Dict[str, str]], max_tokens: Optional[int] = None, model_type: str = "groq") -> Tuple[str, str, str, str]:
@@ -583,6 +588,9 @@ async def generate_shadow(messages: List[Dict[str, str]], max_tokens: Optional[i
         return (choice.message.content or "").strip(), "openai", SHADOW_MODEL, url
 
     client, provider, base_url, used_model = _get_cloud_client(model_type, SHADOW_MODEL)
+    print(">>> CALLING GROQ LLM (Shadow)")
+    print("model:", used_model)
+    print("base_url:", base_url)
     resp = await client.chat.completions.create(
         model=used_model,
         messages=messages,
@@ -593,7 +601,9 @@ async def generate_shadow(messages: List[Dict[str, str]], max_tokens: Optional[i
     choice = resp.choices[0] if resp.choices else None
     if not choice or not getattr(choice, "message", None):
         raise RuntimeError("Shadow model returned no message")
-    return (choice.message.content or "").strip(), provider, used_model, base_url
+    response = (choice.message.content or "").strip()
+    print(">>> LLM RAW RESPONSE (Shadow):", response)
+    return response, provider, used_model, base_url
 
 
 # --- Legacy wrappers (preserve call_primary_llm / call_shadow_llm for main.py) ---
