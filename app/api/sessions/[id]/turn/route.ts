@@ -41,7 +41,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         console.log(`[turn/POST] Calling defense service with modelType=${session.modelType}, defenseMode=${session.defenseMode}`);
         console.log(`[turn/POST] Defense service URL: ${process.env.DEFENSE_SERVICE_URL || 'http://localhost:5000'}/analyze`);
 
-        let defenseResponse: Awaited<ReturnType<typeof callDefenseService>>;
+        let defenseResponse: any;
         try {
             console.log('[turn/POST] Attempting defense service call...');
             defenseResponse = await callDefenseService('/analyze', payload);

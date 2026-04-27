@@ -96,7 +96,7 @@ export default function ConversationHistory({ history }: ConversationHistoryProp
     const highlightThreats = (text: string, threats: any[]) => {
         if (!threats || threats.length === 0) return text;
 
-        const parts: JSX.Element[] = [];
+        const parts: React.ReactNode[] = [];
         let lastIndex = 0;
 
         threats.forEach((threat, idx) => {

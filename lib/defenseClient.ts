@@ -30,7 +30,7 @@ export async function callDefenseService(endpoint: string, data: any) {
         if (!res.ok) {
             let detail = res.statusText;
             try {
-                const errBody = await res.json();
+                const errBody = await res.json() as any;
                 if (errBody?.detail) detail = String(errBody.detail);
                 console.log('[defenseClient] Error body:', errBody);
             } catch {

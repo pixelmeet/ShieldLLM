@@ -5,7 +5,7 @@ import { ShieldCheck, Search, BarChart3, Brain, AlertTriangle } from 'lucide-rea
 
 export default function DefenseDecisionTab() {
     // Demo data
-    const decision = 'ALLOW';
+    const decision: string = 'ALLOW';
     const confidence = 92;
 
     const reasoningPoints = [
