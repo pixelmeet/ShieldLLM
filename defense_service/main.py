@@ -35,64 +35,93 @@ from collections import defaultdict
 import time
 import uuid
 
+import collections
+
 class RateLimiter:
     def __init__(self, requests_per_minute=20, max_clients=10000):
         self.requests_per_minute = requests_per_minute
         self.requests = {}
+        self.locks = {}
         self.max_clients = max_clients
         
+    def _get_lock(self, client_id: str):
+        if client_id not in self.locks:
+            self.locks[client_id] = asyncio.Lock()
+        return self.locks[client_id]
+
     async def is_allowed(self, client_id: str) -> bool:
         now = time.time()
-        if client_id not in self.requests:
-            if len(self.requests) >= self.max_clients:
-                # LRU-style eviction (lock-free approximation)
-                oldest = next(iter(self.requests))
-                self.requests.pop(oldest, None)
-            self.requests[client_id] = []
-            
-        # Sliding window cleanup
-        self.requests[client_id] = [r for r in self.requests[client_id] if now - r < 60]
+        lock = self._get_lock(client_id)
         
-        if len(self.requests[client_id]) < self.requests_per_minute:
-            self.requests[client_id].append(now)
-            return True
-        return False
+        async with lock:
+            if client_id not in self.requests:
+                if len(self.requests) >= self.max_clients:
+                    # Fairness fix: TTL-based cleanup to prioritize inactive clients
+                    cutoff = now - 60
+                    inactive = [k for k, v in self.requests.items() if not v or v[-1] < cutoff]
+                    if inactive:
+                        for k in inactive[:50]:
+                            self.requests.pop(k, None)
+                            self.locks.pop(k, None)
+                    else:
+                        # Fallback to oldest active if no inactive found
+                        oldest = min(self.requests.keys(), key=lambda k: self.requests[k][-1] if self.requests[k] else 0)
+                        self.requests.pop(oldest, None)
+                        self.locks.pop(oldest, None)
+                self.requests[client_id] = []
+                
+            # Sliding window cleanup
+            self.requests[client_id] = [r for r in self.requests[client_id] if now - r < 60]
+            
+            if len(self.requests[client_id]) < self.requests_per_minute:
+                self.requests[client_id].append(now)
+                return True
+            return False
 
 rate_limiter = RateLimiter(requests_per_minute=20)
-llm_semaphore = asyncio.Semaphore(5)  # Limit parallel LLM calls
 
 class MetricsTracker:
     def __init__(self):
         self.total_requests = 0
         self.total_failures = 0
-        self.llm_calls_count = 0
-        self.request_timestamps = []
+        self.request_timestamps = collections.deque()
+        self._lock = asyncio.Lock()
         
-    def record_request(self):
-        self.total_requests += 1
-        now = time.time()
-        self.request_timestamps.append(now)
-        
-    def record_failure(self):
-        self.total_failures += 1
-        
-    def record_llm_call(self):
-        self.llm_calls_count += 1
-        
-    def get_requests_per_minute(self):
-        now = time.time()
-        self.request_timestamps = [t for t in self.request_timestamps if now - t < 60]
-        return len(self.request_timestamps)
+    async def record_request(self):
+        async with self._lock:
+            self.total_requests += 1
+            now = time.time()
+            self.request_timestamps.append(now)
+            while self.request_timestamps and now - self.request_timestamps[0] > 60:
+                self.request_timestamps.popleft()
+                
+    async def record_failure(self):
+        async with self._lock:
+            self.total_failures += 1
+            
+    async def get_metrics_snapshot(self):
+        async with self._lock:
+            now = time.time()
+            while self.request_timestamps and now - self.request_timestamps[0] > 60:
+                self.request_timestamps.popleft()
+            return {
+                "requests_per_minute": len(self.request_timestamps),
+                "total_requests": self.total_requests,
+                "total_failures": self.total_failures
+            }
 
 metrics = MetricsTracker()
 
 class CircuitBreaker:
-    def __init__(self, failure_threshold=5, reset_timeout=300):
+    def __init__(self, failure_threshold=5, success_threshold=2, reset_timeout=300):
         self.failure_threshold = failure_threshold
+        self.success_threshold = success_threshold
         self.reset_timeout = reset_timeout
         self.failures = 0
+        self.successes = 0
         self.last_failure_time = 0
         self.state = "CLOSED"
+        self.half_open_probes = 0
         self.lock = asyncio.Lock()
 
     async def acquire(self) -> bool:
@@ -102,22 +131,35 @@ class CircuitBreaker:
             if self.state == "OPEN":
                 if time.time() - self.last_failure_time >= self.reset_timeout:
                     self.state = "HALF-OPEN"
+                    self.successes = 0
+                    self.half_open_probes = 1
                     return True
                 return False
-            # HALF-OPEN: only 1 request allowed to test recovery
+            if self.state == "HALF-OPEN":
+                if self.half_open_probes < self.success_threshold:
+                    self.half_open_probes += 1
+                    return True
+                return False
             return False
 
     async def record_success(self):
         async with self.lock:
-            self.failures = 0
-            self.state = "CLOSED"
+            if self.state == "HALF-OPEN":
+                self.successes += 1
+                if self.successes >= self.success_threshold:
+                    self.state = "CLOSED"
+                    self.failures = 0
+                    self.successes = 0
+            elif self.state == "CLOSED":
+                self.failures = 0
 
     async def record_failure(self):
         async with self.lock:
             self.failures += 1
             self.last_failure_time = time.time()
-            if self.failures >= self.failure_threshold or self.state == "HALF-OPEN":
+            if self.state == "HALF-OPEN" or self.failures >= self.failure_threshold:
                 self.state = "OPEN"
+                self.half_open_probes = 0
 
 circuit_breaker = CircuitBreaker()
 
@@ -163,13 +205,12 @@ def root():
     }
 
 @app.get("/metrics")
-def get_metrics():
-    return {
-        "requests_per_minute": metrics.get_requests_per_minute(),
-        "total_failures": metrics.total_failures,
-        "circuit_state": circuit_breaker.state,
-        "llm_calls": metrics.llm_calls_count
-    }
+async def get_metrics():
+    from llm_client import get_llm_metrics
+    stats = await metrics.get_metrics_snapshot()
+    stats.update(get_llm_metrics())
+    stats["circuit_state"] = circuit_breaker.state
+    return stats
 
 
 # --- Request / Response models (keep API shape for frontend) ---
@@ -218,7 +259,7 @@ async def analyze_turn(req: TurnRequest, x_forwarded_for: Optional[str] = Header
     req_id = str(uuid.uuid4())
     client_ip = (x_forwarded_for or "unknown").split(",")[0].strip()
     
-    metrics.record_request()
+    await metrics.record_request()
     
     if not await rate_limiter.is_allowed(client_ip):
         logger.warning(json.dumps({
@@ -238,29 +279,29 @@ async def analyze_turn(req: TurnRequest, x_forwarded_for: Optional[str] = Header
         })
 
     try:
-        # Prevent queue DoS by adding a timeout for semaphore acquisition and execution
+        # Prevent queue DoS by adding a timeout for execution
         try:
             async with asyncio.timeout(30.0): # Python 3.11+ 
-                async with llm_semaphore:
-                    res = await _analyze_turn_impl(req, req_id, client_ip)
-                    if isinstance(res, JSONResponse):
-                        # Indicates LLM failure after retries
-                        await circuit_breaker.record_failure()
-                        metrics.record_failure()
-                    else:
-                        await circuit_breaker.record_success()
-                    return res
+                res = await _analyze_turn_impl(req, req_id, client_ip)
+                if isinstance(res, JSONResponse):
+                    # Indicates LLM failure after retries
+                    await circuit_breaker.record_failure()
+                    await metrics.record_failure()
+                else:
+                    await circuit_breaker.record_success()
+                return res
         except (asyncio.TimeoutError, TimeoutError):
             logger.error(json.dumps({
-                "request_id": req_id, "client_id": client_ip, "error": "Timeout acquiring semaphore or executing LLM"
+                "request_id": req_id, "client_id": client_ip, "error": "Timeout executing LLM"
             }))
-            metrics.record_failure()
+            await circuit_breaker.record_failure()
+            await metrics.record_failure()
             raise HTTPException(status_code=503, detail="Server overloaded. Please try again later.")
             
     except HTTPException:
         # Proper HTTP exceptions
         await circuit_breaker.record_failure()
-        metrics.record_failure()
+        await metrics.record_failure()
         raise
     except Exception as e:
         # ALL other generic internal exceptions MUST increment circuit breaker and raise 503
@@ -268,7 +309,7 @@ async def analyze_turn(req: TurnRequest, x_forwarded_for: Optional[str] = Header
             "request_id": req_id, "client_id": client_ip, "error": f"Unhandled analyze error: {str(e)}"
         }))
         await circuit_breaker.record_failure()
-        metrics.record_failure()
+        await metrics.record_failure()
         raise HTTPException(status_code=503, detail="Internal Defense Error")
 
 def parse_llm_json(text: str) -> Dict[str, Any]:
@@ -390,7 +431,6 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
         shadow_output, shadow_data = "", {}
     else:
         # Tier 2: Primary LLM Evaluation
-        metrics.record_llm_call()
         primary_text, primary_meta = await call_primary(primary_messages, retry_budget=retry_budget)
         if not primary_meta.get("ok"):
             # Return explicit degraded response if LLM fails after retries
@@ -411,7 +451,6 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
         # Tier 3: Conditional Shadow Validation (Ambiguous Risk)
         if 30 <= risk_score <= 80 or (risk_score < 30 and inj_score > 40):
             shadow_messages = [{"role": "user", "content": sanitized_user or user_input}]
-            metrics.record_llm_call()
             s_text, shadow_meta = await call_shadow(shadow_messages, retry_budget=retry_budget)
             if shadow_meta.get("ok"):
                 shadow_ok = True

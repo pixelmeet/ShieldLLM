@@ -48,8 +48,29 @@ from cachetools import TTLCache
 llm_cache = TTLCache(maxsize=1000, ttl=3600)
 
 import asyncio
-
 from functools import wraps
+from typing import Dict, Any
+
+llm_stats = {
+    "total_calls": 0,
+    "failed_calls": 0,
+    "cache_hits": 0,
+    "cache_misses": 0
+}
+
+llm_semaphore = asyncio.Semaphore(5)
+
+def get_llm_metrics() -> Dict[str, Any]:
+    size = len(llm_cache)
+    fr = (llm_stats["failed_calls"] / llm_stats["total_calls"]) if llm_stats["total_calls"] > 0 else 0.0
+    return {
+        "cache_hits": llm_stats["cache_hits"],
+        "cache_misses": llm_stats["cache_misses"],
+        "cache_size": size,
+        "llm_total_calls": llm_stats["total_calls"],
+        "llm_failed_calls": llm_stats["failed_calls"],
+        "llm_failure_rate": round(fr, 4)
+    }
 
 # Retry logic moved to call_primary and call_shadow
 
@@ -346,12 +367,15 @@ async def call_primary(
     cache_key = hashlib.md5(str(messages).encode()).hexdigest()
     cached = llm_cache.get(f"primary_{cache_key}")
     if cached:
+        llm_stats["cache_hits"] += 1
         return cached
+    llm_stats["cache_misses"] += 1
 
     budget = retry_budget if retry_budget is not None else {"remaining": 3}
     start = time.perf_counter()
     
     for attempt in range(budget["remaining"] + 1):
+        llm_stats["total_calls"] += 1
         try:
             t = LLM_READ_TIMEOUT if LLM_READ_TIMEOUT > 0 else None
             if t:
@@ -366,6 +390,7 @@ async def call_primary(
             llm_cache[f"primary_{cache_key}"] = res
             return res
         except Exception as e:
+            llm_stats["failed_calls"] += 1
             err_str = str(e).lower()
             is_retryable = any(x in err_str for x in ["429", "rate limit", "timeout", "connection", "retry"])
             if not is_retryable or budget["remaining"] <= 0:
@@ -406,12 +431,15 @@ async def call_shadow(
     cache_key = hashlib.md5(str(messages).encode()).hexdigest()
     cached = llm_cache.get(f"shadow_{cache_key}")
     if cached:
+        llm_stats["cache_hits"] += 1
         return cached
+    llm_stats["cache_misses"] += 1
 
     budget = retry_budget if retry_budget is not None else {"remaining": 3}
     start = time.perf_counter()
     
     for attempt in range(budget["remaining"] + 1):
+        llm_stats["total_calls"] += 1
         try:
             t = LLM_READ_TIMEOUT if LLM_READ_TIMEOUT > 0 else None
             if t:
@@ -426,6 +454,7 @@ async def call_shadow(
             llm_cache[f"shadow_{cache_key}"] = res
             return res
         except Exception as e:
+            llm_stats["failed_calls"] += 1
             err_str = str(e).lower()
             is_retryable = any(x in err_str for x in ["429", "rate limit", "timeout", "connection", "retry"])
             if not is_retryable or budget["remaining"] <= 0:
@@ -448,10 +477,12 @@ async def call_shadow(
 
 async def _generate_primary_impl(messages: List[Dict[str, str]], max_tokens: int) -> str:
     """Internal: can raise. Used by call_primary which catches."""
-    return await generate_primary(messages, max_tokens)
+    async with llm_semaphore:
+        return await generate_primary(messages, max_tokens)
 
 async def _generate_shadow_impl(messages: List[Dict[str, str]], max_tokens: int) -> str:
-    return await generate_shadow(messages, max_tokens)
+    async with llm_semaphore:
+        return await generate_shadow(messages, max_tokens)
 
 
 # --- Public API ---
