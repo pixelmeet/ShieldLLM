@@ -237,6 +237,8 @@ class DivergenceLog(BaseModel):
     llm_mode: Optional[str] = None
 
 class AnalysisResponse(BaseModel):
+    status: str = "ok"
+    message: str = "OK"
     canonicalText: str
     signals: List[str]
     updatedGraph: Dict[str, Any]
@@ -274,7 +276,11 @@ async def analyze_turn(req: TurnRequest, x_forwarded_for: Optional[str] = Header
         }))
         return JSONResponse(status_code=200, content={
             "status": "degraded",
-            "decision": "unverified",
+            "action": "unverified",
+            "riskLevel": "unknown",
+            "scores": {
+                "total": 0
+            },
             "message": "LLM unavailable, request not verified"
         })
 
@@ -369,6 +375,8 @@ def _make_containment_response(
         llm_mode=LLM_MODE_VAL or "legacy",
     )
     return {
+        "status": "ok",
+        "message": "OK",
         "canonicalText": user_input[:500],
         "signals": all_signals,
         "updatedGraph": updated_graph,
@@ -436,7 +444,11 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
             # Return explicit degraded response if LLM fails after retries
             return JSONResponse(content={
                 "status": "degraded",
-                "decision": "unverified",
+                "action": "unverified",
+                "riskLevel": "unknown",
+                "scores": {
+                    "total": 0
+                },
                 "message": "LLM unavailable, request not verified"
             })
         
@@ -511,6 +523,8 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
     )
 
     return AnalysisResponse(
+        status="ok",
+        message="OK",
         canonicalText=canonical_text,
         signals=all_signals,
         updatedGraph=updated_graph,
