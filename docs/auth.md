@@ -251,32 +251,31 @@ import { CreateUserDialog, EditUserDialog } from "@/components/admin/users";
 
 ## Database Configuration
 
-### Supabase Setup (`docs/supabase-sql.md`)
+### MongoDB Setup
 
-**Purpose**: SQL commands to set up the database
+The application uses MongoDB as the primary database. The connection is managed through a central adapter pattern.
 
-**Key Components**:
-1. **Role Enum**: `CREATE TYPE app_role AS ENUM ('admin', 'moderator', 'user');`
-2. **Users Table**: Contains all user fields
-3. **RLS Policies**: Row-level security for data access
-4. **Triggers**: Auto-update timestamps
+**To Add New Profile Fields:**
+1. Update the `User` interface in `types/user.ts`
+2. Add the field definition to `USER_FIELD_DEFS` in `types/user-schema.ts`
+3. The MongoDB adapter will automatically handle storing and retrieving these fields as part of the user document.
 
-**To Add New Profile Fields**:
-1. Add column to the `CREATE TABLE public.users` statement
-2. Update the `User` interface in `types/user.ts`
-3. Add field definition to `USER_FIELD_DEFS` in `types/user-schema.ts`
-
-**Example - Add Phone Number Field**:
-```sql
--- In CREATE TABLE statement:
-"phoneNumber" text,
-
--- In types/user.ts:
+**Example - Add Phone Number Field:**
+```typescript
+// In types/user.ts:
 phoneNumber?: string;
 
--- In types/user-schema.ts:
-{ name: "phoneNumber", label: "Phone Number", ui: "text", placeholder: "+1 (555) 123-4567", contexts: ["signup", "profile"], editableInProfile: true },
+// In types/user-schema.ts:
+{ 
+  name: "phoneNumber", 
+  label: "Phone Number", 
+  ui: "text", 
+  placeholder: "+1 (555) 123-4567", 
+  contexts: ["signup", "profile"], 
+  editableInProfile: true 
+},
 ```
+
 
 ## Customization Examples
 
@@ -297,15 +296,11 @@ export const ROLE_DEFINITIONS = {
 } as const;
 ```
 
-2. **Update Database** (`docs/supabase-sql.md`):
-```sql
-CREATE TYPE app_role AS ENUM ('admin', 'editor', 'moderator', 'user');
-```
-
-3. **Create Editor Page** (`app/editor/page.tsx`):
+2. **Create Editor Page** (`app/editor/page.tsx`):
 ```typescript
 // Create new page with editor-specific functionality
 ```
+
 
 4. **Update Middleware** (`middleware.ts`):
 ```typescript
@@ -421,9 +416,6 @@ CLOUDINARY_API_SECRET=your_api_secret
    - Delete `app/actions/auth.ts`
    - Remove auth-related server actions
 
-4. **Update Database**:
-   - Remove RLS policies
-   - Simplify users table
 
 ### Simplify to Basic User System
 
