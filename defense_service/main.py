@@ -16,6 +16,7 @@ from typing import List, Dict, Any, Optional
 import asyncio
 import logging
 import uvicorn
+import json
 
 from canonicalize import progressive_canonicalize
 from intent_graph import build_intent_graph
@@ -88,31 +89,25 @@ class AnalysisResponse(BaseModel):
 @app.post("/analyze", response_model=AnalysisResponse, response_model_exclude_none=False)
 async def analyze_turn(req: TurnRequest):
     print(f"[defense/analyze] POST /analyze called")
-    print(f"[defense/analyze] Request data: userText={req.userText[:100] if req.userText else 'None'}...")
-    print(f"[defense/analyze] defenseMode={req.defenseMode}, modelType={req.modelType}")
     try:
-        result = await _analyze_turn_impl(req)
-        print(f"[defense/analyze] SUCCESS: action={result.get('action')}, divergence={result.get('divergence_score')}")
-        return result
+        return await _analyze_turn_impl(req)
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.exception("Analyze failed (returning containment): %s", e)
-        # Never crash: return safe containment response (no stack trace or secrets to user)
-        sanitized_user = sanitize_input(req.userText or "")
-        err_safe = "Request failed"
-        if any(x in str(e).lower() for x in ["connection", "timeout", "unreachable"]):
-            err_safe = "Service temporarily unavailable"
-        return _make_containment_response(
-            req=req,
-            final_answer=f"Error: {str(e)}",
-            divergence_score=100.0,
-            primary_output="",
-            shadow_output="",
-            primary_ok=False,
-            shadow_ok=False,
-            primary_err=err_safe,
-            shadow_err="",
-            sanitized_user=sanitized_user,
-        )
+        logger.exception("Analyze failed: %s", e)
+        raise HTTPException(status_code=503, detail=f"Defense service error: {str(e)}")
+
+def parse_llm_json(text: str) -> Dict[str, Any]:
+    """Extract and parse JSON from LLM response."""
+    try:
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1:
+            return json.loads(text[start:end+1])
+        return json.loads(text)
+    except Exception:
+        # Fallback if LLM fails to return valid JSON
+        return {"risk_score": 50, "action": "block", "answer": text, "intent": "unknown"}
 
 
 def _make_containment_response(
@@ -179,158 +174,108 @@ def _make_containment_response(
 async def _analyze_turn_impl(req: TurnRequest):
     user_input = req.userText or ""
 
-    # 1. Canonicalization (for signals; canonical text used in graph)
-    canonical_text, canonical_signals = progressive_canonicalize(user_input)
+    # 1. Preprocessing (Non-blocking)
+    canonical_res = await asyncio.to_thread(progressive_canonicalize, user_input)
+    canonical_text, canonical_signals = canonical_res
+    sanitized_user = await asyncio.to_thread(sanitize_input, user_input)
 
-    # 2. Sanitize for shadow path (remove injection phrases)
-    sanitized_user = sanitize_input(user_input)
-
-    # 3. Intent Graph Builder
+    # 2. Intent Graph Builder (Non-blocking)
     conversation_for_graph = {
         "intent_graph": req.intentGraph,
         "user_text": user_input,
         "signals": canonical_signals,
     }
-    updated_graph, violations = build_intent_graph(conversation_for_graph)
+    graph_res = await asyncio.to_thread(build_intent_graph, conversation_for_graph)
+    updated_graph, violations = graph_res
     all_signals = canonical_signals + violations
 
-    # 4. Prepare prompts: primary = full user input + rules; shadow = sanitized user input only
+    # 3. Prepare prompts
     system_prompt = build_system_prompt(updated_graph)
-    primary_user_message = user_input
-    shadow_user_message = sanitized_user if sanitized_user.strip() else user_input
+    primary_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_input},
+    ]
 
-    # 5. Call both models (or simulated); never raise - use fallback on failure
-    import asyncio
-    from llm_client import LLM_MODE as LLM_MODE_VAL
-
+    # 4. Conditional LLM Execution
     model_type = (req.modelType or "").strip().lower()
-    primary_output: Optional[str] = None
-    shadow_output: Optional[str] = None
-    primary_meta: Dict[str, Any] = {}
-    shadow_meta: Dict[str, Any] = {}
-    primary_ok = False
-    shadow_ok = False
-    primary_err = ""
-    shadow_err = ""
-
+    
     if model_type == "simulated":
-        logger.info("Using simulated mode (no LLM): modelType=%s", req.modelType)
-        primary_output = f"[Simulated] I understand your request: {user_input[:100]}{'...' if len(user_input) > 100 else ''}. In a real session, I would assist with {req.intentGraph.get('goal', 'your task')}."
-        shadow_output = primary_output
+        primary_output = f"[Simulated] I understand your request: {user_input[:100]}..."
+        primary_data = {"intent": "simulated", "risk_score": 0, "action": "allow", "answer": primary_output}
+        primary_ok, shadow_ok = True, True
+        shadow_output, shadow_data = "", {}
+    else:
+        # Call Primary first
+        primary_text, primary_meta = await call_primary(primary_messages)
+        if not primary_meta.get("ok"):
+            raise HTTPException(status_code=503, detail=f"Primary LLM unavailable: {primary_meta.get('error_message')}")
+        
         primary_ok = True
-        shadow_ok = True
-    else:
-        primary_messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": primary_user_message},
-        ]
-        shadow_messages = [{"role": "user", "content": shadow_user_message}]
-        (p_text, primary_meta), (s_text, shadow_meta) = await asyncio.gather(
-            call_primary(primary_messages),
-            call_shadow(shadow_messages),
-        )
-        primary_ok = primary_meta.get("ok", False)
-        shadow_ok = shadow_meta.get("ok", False)
-        primary_output = (p_text or "").strip() if primary_ok else ""
-        shadow_output = (s_text or "").strip() if shadow_ok else ""
-        primary_err = primary_meta.get("error_message", "") or primary_meta.get("error_type", "")
-        shadow_err = shadow_meta.get("error_message", "") or shadow_meta.get("error_type", "")
+        primary_data = parse_llm_json(primary_text)
+        primary_output = primary_data.get("answer", primary_text)
+        risk_score = primary_data.get("risk_score", 0)
+        
+        shadow_ok = False
+        shadow_output = ""
+        shadow_data = {}
+        
+        # Only call Shadow if risk is ambiguous (30-80)
+        if 30 <= risk_score <= 80:
+            shadow_messages = [{"role": "user", "content": sanitized_user or user_input}]
+            s_text, shadow_meta = await call_shadow(shadow_messages)
+            if shadow_meta.get("ok"):
+                shadow_ok = True
+                shadow_data = parse_llm_json(s_text)
+                shadow_output = shadow_data.get("answer", s_text)
+            else:
+                logger.warning("Shadow LLM failed, continuing with primary risk score")
 
-        if not primary_ok:
-            logger.warning("Primary LLM failed: %s", primary_err[:100])
-        if not shadow_ok:
-            logger.warning("Shadow LLM failed: %s", shadow_err[:100])
+    # 5. Improved Decision Logic (Structured)
+    thresholds = (req.policy or {}).get("divergenceThresholds") or {"low": 10, "medium": 30, "high": 60, "critical": 85}
+    divergence_score = float(primary_data.get("risk_score", 0))
+    
+    # If shadow was called, check for intent mismatch or risk delta
+    if shadow_ok and shadow_data:
+        s_risk = shadow_data.get("risk_score", 0)
+        # Intent mismatch increases risk
+        if primary_data.get("intent") != shadow_data.get("intent"):
+            divergence_score = max(divergence_score, 75.0)
+        # Large delta increases risk
+        delta = abs(divergence_score - s_risk)
+        if delta > 40:
+            divergence_score = max(divergence_score, 80.0)
 
-    # 6. Apply fallback logic when models fail
-    thresholds = (req.policy or {}).get("divergenceThresholds") or {}
-    if not primary_ok:
-        # Primary failed: containment (both-fail or primary-fail)
-        divergence_score = 100.0
-        scores = {"semanticDrift": 100, "policyStress": 100, "reasoningMismatch": 100, "total": 100.0}
-        defense_action = "contain"
-        risk_level = "critical"
-        primary_output = primary_output or ""
-        shadow_output = shadow_output or ""
-        conversation_for_defense = {
-            "user_input": user_input,
-            "primary_output": primary_output,
-            "system_prompt": system_prompt,
-            "signals": all_signals,
-            "llm_unavailable": True,
-            "error_message": primary_err,
-        }
-        final_answer = apply_defense(defense_action, conversation_for_defense)
-        defense_action_taken = True
-        rerun_with_cleaned = False
-    elif not shadow_ok:
-        # Shadow failed: degraded mode - use primary, score from heuristics
-        scores = compute_divergence_degraded(
-            primary_output or "",
-            user_input,
-            intent_graph=updated_graph,
-            thresholds=thresholds,
-        )
-        divergence_score = scores.get("total", 0.0)
-        inj_score = injection_indicator_score(user_input)
-        defense_action = decide_defense_action(
-            divergence_score,
-            thresholds,
-            req.defenseMode or "active",
-        )
-        if defense_action == "allow" and inj_score >= 30:
-            defense_action = "clarify"
-        risk_map = {"allow": "low", "clarify": "medium", "sanitize_rerun": "high", "contain": "critical"}
-        risk_level = risk_map.get(defense_action, "medium")
-        conversation_for_defense = {
-            "user_input": user_input,
-            "primary_output": primary_output or "",
-            "system_prompt": system_prompt,
-            "signals": all_signals,
-        }
-        final_answer = apply_defense(defense_action, conversation_for_defense)
-        defense_action_taken = defense_action in ("sanitize_rerun", "contain")
-        rerun_with_cleaned = defense_action == "sanitize_rerun"
-    else:
-        # Both ok: normal flow
-        scores = compute_divergence(
-            primary_output or "",
-            shadow_output or "",
-            intent_graph=updated_graph,
-            thresholds=thresholds,
-        )
-        divergence_score = scores.get("total", 0.0)
-        defense_action = decide_defense_action(
-            divergence_score,
-            thresholds,
-            req.defenseMode or "active",
-        )
-        defense_action_taken = defense_action in ("sanitize_rerun", "contain")
-        rerun_with_cleaned = defense_action == "sanitize_rerun"
-        risk_map = {"allow": "low", "clarify": "medium", "sanitize_rerun": "high", "contain": "critical"}
-        risk_level = risk_map.get(defense_action, "medium")
-        conversation_for_defense = {
-            "user_input": user_input,
-            "primary_output": primary_output or "",
-            "system_prompt": system_prompt,
-            "signals": all_signals,
-        }
-        final_answer = apply_defense(defense_action, conversation_for_defense)
+    defense_action = decide_defense_action(divergence_score, thresholds, req.defenseMode or "active")
+    
+    # Override with LLM's recommended action if explicit
+    if primary_data.get("action") == "block" and divergence_score < thresholds["medium"]:
+        defense_action = "clarify"
 
-    sanitized_text = None
-    if defense_action == "contain":
-        sanitized_text = final_answer
+    risk_map = {"allow": "low", "clarify": "medium", "sanitize_rerun": "high", "contain": "critical"}
+    risk_level = risk_map.get(defense_action, "medium")
+    
+    final_answer = apply_defense(defense_action, {
+        "user_input": user_input,
+        "primary_output": primary_output,
+        "system_prompt": system_prompt,
+        "signals": all_signals
+    })
 
-    # Log object per spec (includes failure metadata)
+    sanitized_text = final_answer if defense_action == "contain" else None
+    defense_action_taken = defense_action in ("sanitize_rerun", "contain")
+    rerun_with_cleaned = defense_action == "sanitize_rerun"
+
+    # Log object (includes failure metadata)
     log_obj = {
         "user_input": user_input,
         "sanitized_input": sanitized_user,
-        "primary_output": primary_output or "",
-        "shadow_output": shadow_output or "",
-        "primary_error": primary_err if not primary_ok else None,
-        "shadow_error": shadow_err if not shadow_ok else None,
+        "primary_output": primary_output,
+        "shadow_output": shadow_output,
         "primary_ok": primary_ok,
         "shadow_ok": shadow_ok,
         "llm_mode": LLM_MODE_VAL or "legacy",
+        "primary_intent": primary_data.get("intent"),
+        "shadow_intent": shadow_data.get("intent") if shadow_ok else None
     }
 
     divergence_log = DivergenceLog(
@@ -340,25 +285,18 @@ async def _analyze_turn_impl(req: TurnRequest):
         rerunWithCleaned=rerun_with_cleaned,
         user_input=user_input,
         sanitized_input=sanitized_user,
-        primary_output=primary_output or "",
-        shadow_output=shadow_output or "",
-        primary_error=primary_err if not primary_ok else None,
-        shadow_error=shadow_err if not shadow_ok else None,
+        primary_output=primary_output,
+        shadow_output=shadow_output,
         primary_ok=primary_ok,
         shadow_ok=shadow_ok,
         llm_mode=LLM_MODE_VAL or "legacy",
-    )
-
-    logger.info(
-        "divergence_score=%.2f action=%s defense_action_taken=%s",
-        divergence_score, defense_action, defense_action_taken,
     )
 
     return {
         "canonicalText": canonical_text,
         "signals": all_signals,
         "updatedGraph": updated_graph,
-        "scores": scores,
+        "scores": {"total": divergence_score},
         "riskLevel": risk_level,
         "action": defense_action,
         "sanitizedText": sanitized_text,

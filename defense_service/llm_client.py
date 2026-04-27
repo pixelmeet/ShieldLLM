@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import time
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -40,6 +41,48 @@ class LLMTimeoutError(Exception):
 class LLMBadResponseError(Exception):
     """LLM returned invalid or empty response."""
     pass
+
+class SimpleCache:
+    """In-memory TTL cache."""
+    def __init__(self, ttl=3600):
+        self.cache = {}
+        self.ttl = ttl
+    def get(self, key: str):
+        if key in self.cache:
+            val, expiry = self.cache[key]
+            if time.time() < expiry: return val
+            del self.cache[key]
+        return None
+    def set(self, key: str, val: Any):
+        self.cache[key] = (val, time.time() + self.ttl)
+
+llm_cache = SimpleCache(ttl=3600)
+
+import asyncio
+from functools import wraps
+
+def retry_async(max_retries=3, base_delay=1):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_err = None
+            for i in range(max_retries + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    last_err = e
+                    # Retry on 429 (RateLimitError), timeouts, or connection errors
+                    err_str = str(e).lower()
+                    is_retryable = any(x in err_str for x in ["429", "rate limit", "timeout", "connection", "retry"])
+                    if i < max_retries and is_retryable:
+                        delay = base_delay * (2 ** i)
+                        logger.warning(f"Retry {i+1}/{max_retries} for {func.__name__} after {delay}s: {e}")
+                        await asyncio.sleep(delay)
+                    else:
+                        break
+            raise last_err
+        return wrapper
+    return decorator
 
 # --- Config from env ---
 LLM_MODE = (os.environ.get("LLM_MODE", "") or "").strip().lower()
@@ -330,6 +373,11 @@ async def call_primary(
         base_url = "huggingface"
     elif LLM_MODE == "transformers":
         base_url = "transformers"
+    cache_key = hashlib.md5(str(messages).encode()).hexdigest()
+    cached = llm_cache.get(f"primary_{cache_key}")
+    if cached:
+        return cached
+
     start = time.perf_counter()
     try:
         t = LLM_READ_TIMEOUT if LLM_READ_TIMEOUT > 0 else None
@@ -341,7 +389,9 @@ async def call_primary(
         else:
             text = await _generate_primary_impl(messages, max_tok)
         elapsed = (time.perf_counter() - start) * 1000
-        return (text, _meta(True, "primary", model, base_url, elapsed))
+        res = (text, _meta(True, "primary", model, base_url, elapsed))
+        llm_cache.set(f"primary_{cache_key}", res)
+        return res
     except (asyncio.TimeoutError, TimeoutError):
         elapsed = (time.perf_counter() - start) * 1000
         return (None, _meta(False, "primary", model, base_url, elapsed, "LLMTimeoutError", "Request timed out"))
@@ -370,6 +420,11 @@ async def call_shadow(
         base_url = "transformers"
     elif not USE_SHADOW_BASE_URL and not LLM_MODE:
         base_url = "openai"
+    cache_key = hashlib.md5(str(messages).encode()).hexdigest()
+    cached = llm_cache.get(f"shadow_{cache_key}")
+    if cached:
+        return cached
+
     start = time.perf_counter()
     try:
         t = LLM_READ_TIMEOUT if LLM_READ_TIMEOUT > 0 else None
@@ -381,7 +436,9 @@ async def call_shadow(
         else:
             text = await _generate_shadow_impl(messages, max_tok)
         elapsed = (time.perf_counter() - start) * 1000
-        return (text, _meta(True, "shadow", model, base_url, elapsed))
+        res = (text, _meta(True, "shadow", model, base_url, elapsed))
+        llm_cache.set(f"shadow_{cache_key}", res)
+        return res
     except (asyncio.TimeoutError, TimeoutError):
         elapsed = (time.perf_counter() - start) * 1000
         return (None, _meta(False, "shadow", model, base_url, elapsed, "LLMTimeoutError", "Request timed out"))
@@ -403,6 +460,7 @@ async def _generate_shadow_impl(messages: List[Dict[str, str]], max_tokens: int)
 
 # --- Public API ---
 
+@retry_async(max_retries=3, base_delay=1)
 async def generate_primary(messages: List[Dict[str, str]], max_tokens: Optional[int] = None) -> str:
     """
     Primary LLM: full conversation + intent constraints.
@@ -453,6 +511,7 @@ async def generate_primary(messages: List[Dict[str, str]], max_tokens: Optional[
     return (choice.message.content or "").strip()
 
 
+@retry_async(max_retries=3, base_delay=1)
 async def generate_shadow(messages: List[Dict[str, str]], max_tokens: Optional[int] = None) -> str:
     """
     Shadow LLM: sanitized user input + short safe summary only (no tools, no full rules).

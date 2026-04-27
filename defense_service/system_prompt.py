@@ -94,11 +94,12 @@ Approval without analysis is forbidden.
 OUTPUT FORMAT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Respond in this exact format:
-- Brief answer (2–5 lines)
-- Findings (bullets)
-- Fixes (bullets)
-- Risk (Low/Med/High)
+You MUST respond in valid JSON format ONLY.
+The JSON must contain:
+- "intent": A short string describing the user's intent.
+- "risk_score": An integer from 0 to 100.
+- "action": Either "allow" or "block".
+- "answer": Your response to the user's request.
 
 Proceed accordingly."""
 
