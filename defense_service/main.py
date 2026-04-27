@@ -38,25 +38,53 @@ import uuid
 class RateLimiter:
     def __init__(self, requests_per_minute=20, max_clients=10000):
         self.requests_per_minute = requests_per_minute
-        self.requests = defaultdict(list)
+        self.requests = {}
         self.max_clients = max_clients
-        self.lock = asyncio.Lock()
         
     async def is_allowed(self, client_id: str) -> bool:
-        async with self.lock:
-            now = time.time()
-            self.requests[client_id] = [r for r in self.requests[client_id] if now - r < 60]
-            if not self.requests[client_id]:
-                del self.requests[client_id]
-            if len(self.requests) > self.max_clients:
-                self.requests.clear() # Prevent OOM
-            if len(self.requests[client_id]) < self.requests_per_minute:
-                self.requests[client_id].append(now)
-                return True
-            return False
+        now = time.time()
+        if client_id not in self.requests:
+            if len(self.requests) >= self.max_clients:
+                # LRU-style eviction (lock-free approximation)
+                oldest = next(iter(self.requests))
+                self.requests.pop(oldest, None)
+            self.requests[client_id] = []
+            
+        # Sliding window cleanup
+        self.requests[client_id] = [r for r in self.requests[client_id] if now - r < 60]
+        
+        if len(self.requests[client_id]) < self.requests_per_minute:
+            self.requests[client_id].append(now)
+            return True
+        return False
 
 rate_limiter = RateLimiter(requests_per_minute=20)
 llm_semaphore = asyncio.Semaphore(5)  # Limit parallel LLM calls
+
+class MetricsTracker:
+    def __init__(self):
+        self.total_requests = 0
+        self.total_failures = 0
+        self.llm_calls_count = 0
+        self.request_timestamps = []
+        
+    def record_request(self):
+        self.total_requests += 1
+        now = time.time()
+        self.request_timestamps.append(now)
+        
+    def record_failure(self):
+        self.total_failures += 1
+        
+    def record_llm_call(self):
+        self.llm_calls_count += 1
+        
+    def get_requests_per_minute(self):
+        now = time.time()
+        self.request_timestamps = [t for t in self.request_timestamps if now - t < 60]
+        return len(self.request_timestamps)
+
+metrics = MetricsTracker()
 
 class CircuitBreaker:
     def __init__(self, failure_threshold=5, reset_timeout=300):
@@ -128,9 +156,19 @@ def root():
         "status": "running",
         "docs": "/docs",
         "health": "/health",
+        "metrics": "/metrics",
         "llm_status": "/llm-status",
         "debug_llm": "GET /debug/llm",
         "analyze": "POST /analyze",
+    }
+
+@app.get("/metrics")
+def get_metrics():
+    return {
+        "requests_per_minute": metrics.get_requests_per_minute(),
+        "total_failures": metrics.total_failures,
+        "circuit_state": circuit_breaker.state,
+        "llm_calls": metrics.llm_calls_count
     }
 
 
@@ -174,55 +212,63 @@ class AnalysisResponse(BaseModel):
     log: Optional[Dict[str, Any]] = None
 
 
-@app.post("/analyze", response_model=AnalysisResponse, response_model_exclude_none=False)
+@app.post("/analyze", response_model_exclude_none=False)
 async def analyze_turn(req: TurnRequest, x_forwarded_for: Optional[str] = Header(None, alias="X-Forwarded-For")):
+    from fastapi.responses import JSONResponse
     req_id = str(uuid.uuid4())
     client_ip = (x_forwarded_for or "unknown").split(",")[0].strip()
     
+    metrics.record_request()
+    
     if not await rate_limiter.is_allowed(client_ip):
-        logger.warning(f"[{req_id}] Rate limit exceeded for {client_ip}")
+        logger.warning(json.dumps({
+            "request_id": req_id, "client_id": client_ip, "error": "Rate limit exceeded"
+        }))
         raise HTTPException(status_code=429, detail="Too many requests. Please wait a minute.")
 
     # Circuit Breaker check
     if not await circuit_breaker.acquire():
-        logger.warning(f"[{req_id}] Service in fallback mode due to repeated LLM failures")
-        sanitized = sanitize_input(req.userText)
-        return {
-            "canonicalText": req.userText[:500],
-            "signals": ["fallback_mode_active"],
-            "updatedGraph": req.intentGraph,
-            "scores": {"total": 0},
-            "riskLevel": "low",
-            "action": "allow",
-            "sanitizedText": "Service is under maintenance.",
-            "primaryOutput": "Service temporarily degraded, proceeding securely.",
-            "shadowOutput": "",
-            "final_answer": "Service temporarily degraded, proceeding securely.",
-            "divergence_score": 0,
-            "defense_action": "allow",
-            "log": {"mode": "fallback"}
-        }
+        logger.warning(json.dumps({
+            "request_id": req_id, "client_id": client_ip, "circuit_state": circuit_breaker.state, "error": "Circuit breaker OPEN"
+        }))
+        return JSONResponse(status_code=200, content={
+            "status": "degraded",
+            "decision": "unverified",
+            "message": "LLM unavailable, request not verified"
+        })
 
     try:
         # Prevent queue DoS by adding a timeout for semaphore acquisition and execution
         try:
             async with asyncio.timeout(30.0): # Python 3.11+ 
                 async with llm_semaphore:
-                    res = await _analyze_turn_impl(req, req_id)
-                    await circuit_breaker.record_success()
+                    res = await _analyze_turn_impl(req, req_id, client_ip)
+                    if isinstance(res, JSONResponse):
+                        # Indicates LLM failure after retries
+                        await circuit_breaker.record_failure()
+                        metrics.record_failure()
+                    else:
+                        await circuit_breaker.record_success()
                     return res
         except (asyncio.TimeoutError, TimeoutError):
-            logger.error(f"[{req_id}] Timeout acquiring semaphore or executing LLM")
+            logger.error(json.dumps({
+                "request_id": req_id, "client_id": client_ip, "error": "Timeout acquiring semaphore or executing LLM"
+            }))
+            metrics.record_failure()
             raise HTTPException(status_code=503, detail="Server overloaded. Please try again later.")
             
     except HTTPException:
-        # Proper HTTP exceptions (like 503 from LLM failure or overloaded) 
+        # Proper HTTP exceptions
         await circuit_breaker.record_failure()
+        metrics.record_failure()
         raise
     except Exception as e:
         # ALL other generic internal exceptions MUST increment circuit breaker and raise 503
-        logger.exception(f"[{req_id}] Unhandled analyze error: {e}")
+        logger.exception(json.dumps({
+            "request_id": req_id, "client_id": client_ip, "error": f"Unhandled analyze error: {str(e)}"
+        }))
         await circuit_breaker.record_failure()
+        metrics.record_failure()
         raise HTTPException(status_code=503, detail="Internal Defense Error")
 
 def parse_llm_json(text: str) -> Dict[str, Any]:
@@ -299,7 +345,8 @@ def _make_containment_response(
     }
 
 
-async def _analyze_turn_impl(req: TurnRequest, req_id: str):
+async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
+    from fastapi.responses import JSONResponse
     user_input = req.userText or ""
 
     # 1. Preprocessing (Non-blocking)
@@ -327,10 +374,12 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str):
     # 4. Hybrid Confidence-Based Execution
     model_type = (req.modelType or "").strip().lower()
     
-    # Tier 1: Heuristic / Rule check (Lightweight)
+    retry_budget = {"remaining": 3}
+    primary_meta = {}
+    risk_score = 0
     inj_score = injection_indicator_score(user_input)
+    
     if inj_score >= 80:
-        logger.info("Heuristic trigger: high risk detected (%s)", inj_score)
         primary_data = {"intent": "attack", "risk_score": 95, "action": "block", "answer": "Request blocked by safety filters."}
         primary_ok, shadow_ok = True, False
         primary_output, shadow_output, shadow_data = primary_data["answer"], "", {}
@@ -341,9 +390,15 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str):
         shadow_output, shadow_data = "", {}
     else:
         # Tier 2: Primary LLM Evaluation
-        primary_text, primary_meta = await call_primary(primary_messages)
+        metrics.record_llm_call()
+        primary_text, primary_meta = await call_primary(primary_messages, retry_budget=retry_budget)
         if not primary_meta.get("ok"):
-            raise HTTPException(status_code=503, detail=f"Primary LLM unavailable: {primary_meta.get('error_message')}")
+            # Return explicit degraded response if LLM fails after retries
+            return JSONResponse(content={
+                "status": "degraded",
+                "decision": "unverified",
+                "message": "LLM unavailable, request not verified"
+            })
         
         primary_ok = True
         primary_data = parse_llm_json(primary_text)
@@ -356,7 +411,8 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str):
         # Tier 3: Conditional Shadow Validation (Ambiguous Risk)
         if 30 <= risk_score <= 80 or (risk_score < 30 and inj_score > 40):
             shadow_messages = [{"role": "user", "content": sanitized_user or user_input}]
-            s_text, shadow_meta = await call_shadow(shadow_messages)
+            metrics.record_llm_call()
+            s_text, shadow_meta = await call_shadow(shadow_messages, retry_budget=retry_budget)
             if shadow_meta.get("ok"):
                 shadow_ok = True
                 shadow_data = parse_llm_json(s_text)
@@ -387,21 +443,19 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str):
     defense_action_taken = defense_action in ("sanitize_rerun", "contain")
     rerun_with_cleaned = defense_action == "sanitize_rerun"
 
-    # Log object (includes failure metadata)
-    log_obj = {
-        "req_id": req_id,
-        "user_input": user_input,
-        "sanitized_input": sanitized_user,
-        "primary_output": primary_output,
-        "shadow_output": shadow_output,
-        "primary_ok": primary_ok,
-        "shadow_ok": shadow_ok,
-        "llm_mode": LLM_MODE_VAL or "legacy",
-        "primary_intent": primary_data.get("intent"),
-        "shadow_intent": shadow_data.get("intent") if shadow_ok else None
+    log_data = {
+        "request_id": req_id,
+        "client_id": client_ip,
+        "cache_hit": getattr(primary_meta, "get", lambda x, y: y)("latency_ms", 1) < 5 if primary_meta else False,
+        "circuit_state": circuit_breaker.state,
+        "risk_score": risk_score,
+        "divergence_score": divergence_score,
+        "decision": defense_action,
+        "llm_provider_used": getattr(primary_meta, "get", lambda x, y: y)("model", PRIMARY_MODEL) if primary_meta else "none",
+        "latency_ms": getattr(primary_meta, "get", lambda x, y: y)("latency_ms", 0) if primary_meta else 0,
+        "error": getattr(primary_meta, "get", lambda x, y: y)("error_message", "") if primary_meta else ""
     }
-    
-    logger.info(f"[{req_id}] Completed analysis: risk={divergence_score} action={defense_action}")
+    logger.info(json.dumps(log_data))
 
     divergence_log = DivergenceLog(
         divergenceScore=divergence_score,
@@ -417,22 +471,22 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str):
         llm_mode=LLM_MODE_VAL or "legacy",
     )
 
-    return {
-        "canonicalText": canonical_text,
-        "signals": all_signals,
-        "updatedGraph": updated_graph,
-        "scores": {"total": divergence_score},
-        "riskLevel": risk_level,
-        "action": defense_action,
-        "sanitizedText": sanitized_text,
-        "primaryOutput": final_answer,
-        "shadowOutput": shadow_output,
-        "divergenceLog": divergence_log,
-        "final_answer": final_answer,
-        "divergence_score": divergence_score,
-        "defense_action": defense_action,
-        "log": log_obj,
-    }
+    return AnalysisResponse(
+        canonicalText=canonical_text,
+        signals=all_signals,
+        updatedGraph=updated_graph,
+        scores={"total": divergence_score},
+        riskLevel=risk_level,
+        action=defense_action,
+        sanitizedText=sanitized_text,
+        primaryOutput=final_answer,
+        shadowOutput=shadow_output,
+        divergenceLog=divergence_log,
+        final_answer=final_answer,
+        divergence_score=divergence_score,
+        defense_action=defense_action,
+        log=log_data
+    )
 
 
 @app.get("/health")

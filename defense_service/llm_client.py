@@ -51,28 +51,7 @@ import asyncio
 
 from functools import wraps
 
-def retry_async(max_retries=3, base_delay=1):
-    def decorator(func):
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            last_err = None
-            for i in range(max_retries + 1):
-                try:
-                    return await func(*args, **kwargs)
-                except Exception as e:
-                    last_err = e
-                    # Retry on 429 (RateLimitError), timeouts, or connection errors
-                    err_str = str(e).lower()
-                    is_retryable = any(x in err_str for x in ["429", "rate limit", "timeout", "connection", "retry"])
-                    if i < max_retries and is_retryable:
-                        delay = base_delay * (2 ** i)
-                        logger.warning(f"Retry {i+1}/{max_retries} for {func.__name__} after {delay}s: {e}")
-                        await asyncio.sleep(delay)
-                    else:
-                        break
-            raise last_err
-        return wrapper
-    return decorator
+# Retry logic moved to call_primary and call_shadow
 
 # --- Config from env ---
 LLM_MODE = (os.environ.get("LLM_MODE", "") or "").strip().lower()
@@ -349,6 +328,7 @@ def _meta(ok: bool, role: str, model: str, base_url: str = "", latency_ms: float
 async def call_primary(
     messages: List[Dict[str, str]],
     max_tokens: Optional[int] = None,
+    retry_budget: Optional[Dict[str, int]] = None
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Primary LLM call. Returns (text, meta). Never raises.
@@ -368,35 +348,48 @@ async def call_primary(
     if cached:
         return cached
 
+    budget = retry_budget if retry_budget is not None else {"remaining": 3}
     start = time.perf_counter()
-    try:
-        t = LLM_READ_TIMEOUT if LLM_READ_TIMEOUT > 0 else None
-        if t:
-            text = await asyncio.wait_for(
-                _generate_primary_impl(messages, max_tok),
-                timeout=t,
-            )
-        else:
-            text = await _generate_primary_impl(messages, max_tok)
-        elapsed = (time.perf_counter() - start) * 1000
-        res = (text, _meta(True, "primary", model, base_url, elapsed))
-        llm_cache[f"primary_{cache_key}"] = res
-        return res
-    except (asyncio.TimeoutError, TimeoutError):
-        elapsed = (time.perf_counter() - start) * 1000
-        return (None, _meta(False, "primary", model, base_url, elapsed, "LLMTimeoutError", "Request timed out"))
-    except (ConnectionError, OSError) as e:
-        elapsed = (time.perf_counter() - start) * 1000
-        return (None, _meta(False, "primary", model, base_url, elapsed, "LLMConnectionError", str(e)))
-    except Exception as e:
-        elapsed = (time.perf_counter() - start) * 1000
-        err_type = type(e).__name__
-        return (None, _meta(False, "primary", model, base_url, elapsed, err_type, str(e)))
+    
+    for attempt in range(budget["remaining"] + 1):
+        try:
+            t = LLM_READ_TIMEOUT if LLM_READ_TIMEOUT > 0 else None
+            if t:
+                text = await asyncio.wait_for(
+                    _generate_primary_impl(messages, max_tok),
+                    timeout=t,
+                )
+            else:
+                text = await _generate_primary_impl(messages, max_tok)
+            elapsed = (time.perf_counter() - start) * 1000
+            res = (text, _meta(True, "primary", model, base_url, elapsed))
+            llm_cache[f"primary_{cache_key}"] = res
+            return res
+        except Exception as e:
+            err_str = str(e).lower()
+            is_retryable = any(x in err_str for x in ["429", "rate limit", "timeout", "connection", "retry"])
+            if not is_retryable or budget["remaining"] <= 0:
+                elapsed = (time.perf_counter() - start) * 1000
+                err_type = type(e).__name__
+                if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+                    err_type = "LLMTimeoutError"
+                elif isinstance(e, (ConnectionError, OSError)):
+                    err_type = "LLMConnectionError"
+                return (None, _meta(False, "primary", model, base_url, elapsed, err_type, str(e)))
+            
+            budget["remaining"] -= 1
+            delay = min(2 ** (3 - budget["remaining"]), 8) # max 8s backoff
+            logger.warning(f"Retry primary after {delay}s. Remaining budget: {budget['remaining']}")
+            await asyncio.sleep(delay)
+            
+    elapsed = (time.perf_counter() - start) * 1000
+    return (None, _meta(False, "primary", model, base_url, elapsed, "MaxRetriesExceeded", "Retries exhausted"))
 
 
 async def call_shadow(
     messages: List[Dict[str, str]],
     max_tokens: Optional[int] = None,
+    retry_budget: Optional[Dict[str, int]] = None
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Shadow LLM call. Returns (text, meta). Never raises.
@@ -415,29 +408,42 @@ async def call_shadow(
     if cached:
         return cached
 
+    budget = retry_budget if retry_budget is not None else {"remaining": 3}
     start = time.perf_counter()
-    try:
-        t = LLM_READ_TIMEOUT if LLM_READ_TIMEOUT > 0 else None
-        if t:
-            text = await asyncio.wait_for(
-                _generate_shadow_impl(messages, max_tok),
-                timeout=t,
-            )
-        else:
-            text = await _generate_shadow_impl(messages, max_tok)
-        elapsed = (time.perf_counter() - start) * 1000
-        res = (text, _meta(True, "shadow", model, base_url, elapsed))
-        llm_cache[f"shadow_{cache_key}"] = res
-        return res
-    except (asyncio.TimeoutError, TimeoutError):
-        elapsed = (time.perf_counter() - start) * 1000
-        return (None, _meta(False, "shadow", model, base_url, elapsed, "LLMTimeoutError", "Request timed out"))
-    except (ConnectionError, OSError) as e:
-        elapsed = (time.perf_counter() - start) * 1000
-        return (None, _meta(False, "shadow", model, base_url, elapsed, "LLMConnectionError", str(e)))
-    except Exception as e:
-        elapsed = (time.perf_counter() - start) * 1000
-        return (None, _meta(False, "shadow", model, base_url, elapsed, type(e).__name__, str(e)))
+    
+    for attempt in range(budget["remaining"] + 1):
+        try:
+            t = LLM_READ_TIMEOUT if LLM_READ_TIMEOUT > 0 else None
+            if t:
+                text = await asyncio.wait_for(
+                    _generate_shadow_impl(messages, max_tok),
+                    timeout=t,
+                )
+            else:
+                text = await _generate_shadow_impl(messages, max_tok)
+            elapsed = (time.perf_counter() - start) * 1000
+            res = (text, _meta(True, "shadow", model, base_url, elapsed))
+            llm_cache[f"shadow_{cache_key}"] = res
+            return res
+        except Exception as e:
+            err_str = str(e).lower()
+            is_retryable = any(x in err_str for x in ["429", "rate limit", "timeout", "connection", "retry"])
+            if not is_retryable or budget["remaining"] <= 0:
+                elapsed = (time.perf_counter() - start) * 1000
+                err_type = type(e).__name__
+                if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+                    err_type = "LLMTimeoutError"
+                elif isinstance(e, (ConnectionError, OSError)):
+                    err_type = "LLMConnectionError"
+                return (None, _meta(False, "shadow", model, base_url, elapsed, err_type, str(e)))
+            
+            budget["remaining"] -= 1
+            delay = min(2 ** (3 - budget["remaining"]), 8) # max 8s backoff
+            logger.warning(f"Retry shadow after {delay}s. Remaining budget: {budget['remaining']}")
+            await asyncio.sleep(delay)
+            
+    elapsed = (time.perf_counter() - start) * 1000
+    return (None, _meta(False, "shadow", model, base_url, elapsed, "MaxRetriesExceeded", "Retries exhausted"))
 
 
 async def _generate_primary_impl(messages: List[Dict[str, str]], max_tokens: int) -> str:
@@ -450,7 +456,6 @@ async def _generate_shadow_impl(messages: List[Dict[str, str]], max_tokens: int)
 
 # --- Public API ---
 
-@retry_async(max_retries=3, base_delay=1)
 async def generate_primary(messages: List[Dict[str, str]], max_tokens: Optional[int] = None) -> str:
     """
     Primary LLM: full conversation + intent constraints.
@@ -501,7 +506,6 @@ async def generate_primary(messages: List[Dict[str, str]], max_tokens: Optional[
     return (choice.message.content or "").strip()
 
 
-@retry_async(max_retries=3, base_delay=1)
 async def generate_shadow(messages: List[Dict[str, str]], max_tokens: Optional[int] = None) -> str:
     """
     Shadow LLM: sanitized user input + short safe summary only (no tools, no full rules).
