@@ -28,10 +28,8 @@ def apply_defense(defense_action: str, conversation: Dict[str, Any]) -> str:
 
     if defense_action == "contain":
         if conversation.get("llm_unavailable"):
-            return (
-                "The analysis service is temporarily unavailable. "
-                "Please try again in a moment. For now, avoid running untrusted code or approving changes without manual review."
-            )
+            err_msg = conversation.get("error_message") or "Unknown error"
+            return f"Error: LLM Connection Failed - {err_msg}"
         return (
             "I'm not able to respond to this request. "
             "It may conflict with safety or usage policies. Please try a different question."

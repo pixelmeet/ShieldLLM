@@ -103,7 +103,7 @@ async def analyze_turn(req: TurnRequest):
             err_safe = "Service temporarily unavailable"
         return _make_containment_response(
             req=req,
-            final_answer="The analysis service encountered an unexpected error. Please try again later. Avoid running untrusted code or approving changes without manual review.",
+            final_answer=f"Error: {str(e)}",
             divergence_score=100.0,
             primary_output="",
             shadow_output="",
@@ -257,6 +257,7 @@ async def _analyze_turn_impl(req: TurnRequest):
             "system_prompt": system_prompt,
             "signals": all_signals,
             "llm_unavailable": True,
+            "error_message": primary_err,
         }
         final_answer = apply_defense(defense_action, conversation_for_defense)
         defense_action_taken = True
