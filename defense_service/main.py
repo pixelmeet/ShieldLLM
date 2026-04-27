@@ -58,11 +58,14 @@ def try_decode(user_input: str) -> str:
 def validate_response_contract(llm_data: Dict[str, Any], final_score: float, final_risk: str):
     """Enforce strict scoring-to-risk mapping and check for LLM internal inconsistency."""
     total = final_score
-    llm_risk = str(llm_data.get("riskLevel", "")).lower()
-    llm_score = float(llm_data.get("risk_score", 0))
+    
+    # Map new schema risk_level to numeric if present
+    level_map = {"low": 10, "medium": 45, "high": 75, "critical": 95}
+    llm_risk_str = str(llm_data.get("risk_level", llm_data.get("riskLevel", ""))).lower()
+    llm_score = float(llm_data.get("risk_score", level_map.get(llm_risk_str, 0)))
     
     # 1. Internal Consistency: Did the LLM claim low risk but high score?
-    if llm_score > 70 and llm_risk == "low":
+    if llm_score > 70 and llm_risk_str == "low":
         raise HTTPException(500, "Invalid model response: LLM internal risk mismatch")
     
     # 2. Safety Mapping: Is the final risk level appropriate for the score?
@@ -208,14 +211,23 @@ circuit_breaker = CircuitBreaker()
 
 def compute_advanced_divergence(p_data: dict, s_data: dict) -> dict:
     """Weighted divergence scoring based on intent and risk gaps."""
-    if not s_data:
-        return {"divergence_score": float(p_data.get("risk_score", 0)), "reason": "none"}
+    level_map = {"low": 10, "medium": 45, "high": 75, "critical": 95}
     
-    score = float(p_data.get("risk_score", 0))
+    def get_score(data):
+        if not data: return 0
+        if "risk_score" in data: return float(data["risk_score"])
+        level = str(data.get("risk_level", "low")).lower()
+        return level_map.get(level, 10)
+
+    p_score = get_score(p_data)
+    if not s_data:
+        return {"divergence_score": float(p_score), "reason": "none"}
+    
+    score = p_score
     reason = "none"
     
-    p_intent = str(p_data.get("intent", "")).strip().lower()
-    s_intent = str(s_data.get("intent", "")).strip().lower()
+    p_intent = str(p_data.get("intent", p_data.get("input_threat", ""))).strip().lower()
+    s_intent = str(s_data.get("intent", s_data.get("input_threat", ""))).strip().lower()
     
     # Weight 1: Intent Mismatch (only if meaningful)
     if p_intent and s_intent and p_intent != s_intent:
@@ -223,7 +235,7 @@ def compute_advanced_divergence(p_data: dict, s_data: dict) -> dict:
         reason = "intent_mismatch"
     
     # Weight 2: Risk Delta
-    s_risk = float(s_data.get("risk_score", 0))
+    s_risk = get_score(s_data)
     risk_delta = abs(score - s_risk)
     if risk_delta > 40:
         score = max(score, 80.0)
@@ -392,7 +404,14 @@ def parse_llm_json(text: str) -> Dict[str, Any]:
         return json.loads(text)
     except Exception:
         # Safe fallback, avoiding false positives on poor parsing
-        return {"risk_score": 0, "action": "unknown", "intent": "parse_error", "answer": text}
+        return {
+            "risk_level": "medium", 
+            "risk_score": 50, 
+            "action": "warn", 
+            "input_threat": "parse_error", 
+            "response": text,
+            "reason": "Failed to parse JSON response"
+        }
 
 
 def _make_containment_response(
@@ -543,8 +562,11 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str, star
         
         primary_ok = True
         primary_data = parse_llm_json(primary_text)
-        primary_output = primary_data.get("answer", primary_text)
-        risk_score = primary_data.get("risk_score", 0)
+        primary_output = primary_data.get("response") or primary_data.get("answer") or primary_text
+        
+        # Determine risk score from level or score
+        level_map = {"low": 10, "medium": 45, "high": 75, "critical": 95}
+        risk_score = level_map.get(str(primary_data.get("risk_level", "")).lower(), float(primary_data.get("risk_score", 0)))
         
         shadow_ok = False
         shadow_output, shadow_data = "", {}
@@ -564,7 +586,7 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str, star
             if shadow_meta.get("ok"):
                 shadow_ok = True
                 shadow_data = parse_llm_json(s_text)
-                shadow_output = shadow_data.get("answer", s_text)
+                shadow_output = shadow_data.get("response") or shadow_data.get("answer") or s_text
             else:
                 shadow_failed = True
 
@@ -583,8 +605,24 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str, star
     else:
         defense_action = decide_defense_action(divergence_score, thresholds, req.defenseMode or "active")
     
-    # Tier 4: Blocking Override
-    if primary_data.get("action") == "block" and divergence_score > thresholds["low"]:
+    # Tier 4: Blocking Overrides (New Hardening Rules)
+    weapon_patterns = [
+        r"\\x[0-9a-fA-F]{2}", # Hex shellcode
+        r"(?:exec|system|spawn|eval|open)\s*\(", # Process execution in code
+        r"(?:base64 -d|sh -c|bash -i|/dev/tcp/)", # Linux shell tricks
+        r"powershell\s+(?:-enc|-Command)", # PowerShell tricks
+        r"(?:DROP|DELETE|UPDATE|TRUNCATE)\s+(?:TABLE|FROM|DATABASE)", # Destructive SQL
+    ]
+    output_weaponized = any(re.search(p, primary_output, re.IGNORECASE) for p in weapon_patterns)
+
+    is_blocked = (
+        primary_data.get("action") == "block" or 
+        primary_data.get("output_threat", "none").lower() != "none" or
+        primary_data.get("session_anomaly") is True or
+        float(primary_data.get("confidence", 1.0)) < 0.4 or
+        output_weaponized # Fix #9: Output Weaponization Scan
+    )
+    if is_blocked and divergence_score > thresholds["low"]:
         defense_action = "contain"
 
     risk_map = {"allow": "low", "clarify": "medium", "sanitize_rerun": "high", "contain": "critical"}
@@ -597,7 +635,8 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str, star
         "user_input": user_input,
         "primary_output": primary_output,
         "system_prompt": system_prompt,
-        "signals": all_signals + [div_results["reason"]] if div_results.get("reason") and div_results["reason"] != "none" else all_signals
+        "signals": all_signals + [div_results["reason"]] if div_results.get("reason") and div_results["reason"] != "none" else all_signals,
+        "weaponized": output_weaponized
     })
 
     sanitized_text = final_answer if defense_action == "contain" else None
