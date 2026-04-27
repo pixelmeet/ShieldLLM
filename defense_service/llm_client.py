@@ -160,23 +160,27 @@ def _get_hf_client():
     return _hf_client
 
 
-# --- Groq backend ---
-GROQ_API_BASE = "https://api.groq.com/openai/v1"
-
-
-def _get_groq_client():
+# --- Cloud backend (Groq/OpenAI) ---
+def _get_cloud_client(model_type: str, requested_model: str):
     from openai import AsyncOpenAI
-    api_key = os.environ.get("GROQ_API_KEY", "").strip()
-    if not api_key:
-        # Fallback for ease of testing if user provided it in OPENAI_API_KEY
+    
+    if model_type == "groq":
+        api_key = os.environ.get("GROQ_API_KEY", "").strip()
+        base_url = "https://api.groq.com/openai/v1"
+        provider = "groq"
+        model = "llama3-8b-8192" # Enforce Groq model
+    elif model_type == "openai":
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-        
-    if not api_key or "xxxx" in api_key.lower() or len(api_key) < 10 or api_key.startswith("sk-proj-"):
-        raise ValueError(
-            "GROQ_API_KEY required. "
-            "Get a key at https://console.groq.com/keys"
-        )
-    return AsyncOpenAI(api_key=api_key, base_url=GROQ_API_BASE)
+        base_url = "https://api.openai.com/v1"
+        provider = "openai"
+        model = requested_model
+    else:
+        raise ValueError(f"Invalid or missing provider modelType: {model_type}")
+
+    if not api_key or "xxxx" in api_key.lower() or len(api_key) < 10 or (provider == "groq" and api_key.startswith("sk-proj-")):
+        raise ValueError(f"{provider.upper()}_API_KEY required or invalid. Wrong API key or provider.")
+
+    return AsyncOpenAI(api_key=api_key, base_url=base_url), provider, base_url, model
 
 
 # --- Transformers backend (in-process) ---
@@ -323,7 +327,7 @@ async def check_shadow_health() -> bool:
 # --- Public API: call_primary / call_shadow return (text, meta), never raise ---
 
 def _meta(ok: bool, role: str, model: str, base_url: str = "", latency_ms: float = 0,
-          error_type: str = "", error_message: str = "") -> Dict[str, Any]:
+          error_type: str = "", error_message: str = "", provider: str = "", model_type: str = "") -> Dict[str, Any]:
     """Build meta dict; sanitize error_message to avoid leaking internals."""
     msg = error_message[:200] if error_message else ""
     for s in ("api_key", "sk-", "token", "password", "secret"):
@@ -337,13 +341,16 @@ def _meta(ok: bool, role: str, model: str, base_url: str = "", latency_ms: float
         "base_url": base_url or "",
         "error_type": error_type,
         "error_message": msg,
+        "provider": provider or role,
+        "model_type": model_type or role
     }
 
 
 async def call_primary(
     messages: List[Dict[str, str]],
     max_tokens: Optional[int] = None,
-    retry_budget: Optional[Dict[str, int]] = None
+    retry_budget: Optional[Dict[str, int]] = None,
+    model_type: str = "groq"
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Primary LLM call. Returns (text, meta). Never raises.
@@ -373,14 +380,14 @@ async def call_primary(
         try:
             t = LLM_READ_TIMEOUT if LLM_READ_TIMEOUT > 0 else None
             if t:
-                text = await asyncio.wait_for(
-                    _generate_primary_impl(messages, max_tok),
+                text, used_provider, used_model, used_base_url = await asyncio.wait_for(
+                    _generate_primary_impl(messages, max_tok, model_type),
                     timeout=t,
                 )
             else:
-                text = await _generate_primary_impl(messages, max_tok)
+                text, used_provider, used_model, used_base_url = await _generate_primary_impl(messages, max_tok, model_type)
             elapsed = (time.perf_counter() - start) * 1000
-            res = (text, _meta(True, "primary", model, base_url, elapsed))
+            res = (text, _meta(True, "primary", used_model, used_base_url, elapsed, provider=used_provider, model_type=model_type))
             llm_cache[f"primary_{cache_key}"] = res
             return res
         except Exception as e:
@@ -394,7 +401,7 @@ async def call_primary(
                     err_type = "LLMTimeoutError"
                 elif isinstance(e, (ConnectionError, OSError)):
                     err_type = "LLMConnectionError"
-                return (None, _meta(False, "primary", model, base_url, elapsed, err_type, str(e)))
+                return (None, _meta(False, "primary", model, base_url, elapsed, err_type, str(e), provider=model_type, model_type=model_type))
             
             budget["remaining"] -= 1
             delay = min(2 ** (3 - budget["remaining"]), 8) # max 8s backoff
@@ -402,13 +409,14 @@ async def call_primary(
             await asyncio.sleep(delay)
             
     elapsed = (time.perf_counter() - start) * 1000
-    return (None, _meta(False, "primary", model, base_url, elapsed, "MaxRetriesExceeded", "Retries exhausted"))
+    return (None, _meta(False, "primary", model, base_url, elapsed, "MaxRetriesExceeded", "Retries exhausted", provider=model_type, model_type=model_type))
 
 
 async def call_shadow(
     messages: List[Dict[str, str]],
     max_tokens: Optional[int] = None,
-    retry_budget: Optional[Dict[str, int]] = None
+    retry_budget: Optional[Dict[str, int]] = None,
+    model_type: str = "groq"
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Shadow LLM call. Returns (text, meta). Never raises.
@@ -437,14 +445,14 @@ async def call_shadow(
         try:
             t = LLM_READ_TIMEOUT if LLM_READ_TIMEOUT > 0 else None
             if t:
-                text = await asyncio.wait_for(
-                    _generate_shadow_impl(messages, max_tok),
+                text, used_provider, used_model, used_base_url = await asyncio.wait_for(
+                    _generate_shadow_impl(messages, max_tok, model_type),
                     timeout=t,
                 )
             else:
-                text = await _generate_shadow_impl(messages, max_tok)
+                text, used_provider, used_model, used_base_url = await _generate_shadow_impl(messages, max_tok, model_type)
             elapsed = (time.perf_counter() - start) * 1000
-            res = (text, _meta(True, "shadow", model, base_url, elapsed))
+            res = (text, _meta(True, "shadow", used_model, used_base_url, elapsed, provider=used_provider, model_type=model_type))
             llm_cache[f"shadow_{cache_key}"] = res
             return res
         except Exception as e:
@@ -458,7 +466,7 @@ async def call_shadow(
                     err_type = "LLMTimeoutError"
                 elif isinstance(e, (ConnectionError, OSError)):
                     err_type = "LLMConnectionError"
-                return (None, _meta(False, "shadow", model, base_url, elapsed, err_type, str(e)))
+                return (None, _meta(False, "shadow", model, base_url, elapsed, err_type, str(e), provider=model_type, model_type=model_type))
             
             budget["remaining"] -= 1
             delay = min(2 ** (3 - budget["remaining"]), 8) # max 8s backoff
@@ -466,22 +474,22 @@ async def call_shadow(
             await asyncio.sleep(delay)
             
     elapsed = (time.perf_counter() - start) * 1000
-    return (None, _meta(False, "shadow", model, base_url, elapsed, "MaxRetriesExceeded", "Retries exhausted"))
+    return (None, _meta(False, "shadow", model, base_url, elapsed, "MaxRetriesExceeded", "Retries exhausted", provider=model_type, model_type=model_type))
 
 
-async def _generate_primary_impl(messages: List[Dict[str, str]], max_tokens: int) -> str:
+async def _generate_primary_impl(messages: List[Dict[str, str]], max_tokens: int, model_type: str) -> Tuple[str, str, str, str]:
     """Internal: can raise. Used by call_primary which catches."""
     async with llm_semaphore:
-        return await generate_primary(messages, max_tokens)
+        return await generate_primary(messages, max_tokens, model_type)
 
-async def _generate_shadow_impl(messages: List[Dict[str, str]], max_tokens: int) -> str:
+async def _generate_shadow_impl(messages: List[Dict[str, str]], max_tokens: int, model_type: str) -> Tuple[str, str, str, str]:
     async with llm_semaphore:
-        return await generate_shadow(messages, max_tokens)
+        return await generate_shadow(messages, max_tokens, model_type)
 
 
 # --- Public API ---
 
-async def generate_primary(messages: List[Dict[str, str]], max_tokens: Optional[int] = None) -> str:
+async def generate_primary(messages: List[Dict[str, str]], max_tokens: Optional[int] = None, model_type: str = "groq") -> Tuple[str, str, str, str]:
     """
     Primary LLM: full conversation + intent constraints.
     messages: [{"role":"system","content":"..."}, {"role":"user","content":"..."}]
@@ -498,13 +506,14 @@ async def generate_primary(messages: List[Dict[str, str]], max_tokens: Optional[
         choice = resp.choices[0] if resp.choices else None
         if not choice or not getattr(choice, "message", None):
             raise RuntimeError("Primary model returned no message")
-        return (choice.message.content or "").strip()
+        return (choice.message.content or "").strip(), "lmstudio", PRIMARY_MODEL, PRIMARY_BASE_URL or "http://localhost:1234/v1"
 
     if LLM_MODE == "transformers":
         model, tokenizer, device = _load_transformers_primary()
-        return await asyncio.to_thread(
+        text = await asyncio.to_thread(
             _transformers_generate, model, tokenizer, device, messages, mt
         )
+        return text, "transformers", PRIMARY_MODEL, "transformers"
 
     if USE_HF_PRIMARY:
         client = _get_hf_client()
@@ -516,11 +525,11 @@ async def generate_primary(messages: List[Dict[str, str]], max_tokens: Optional[
             seed=42,
         )
         choice = resp.choices[0]
-        return (choice.message.content or "").strip()
+        return (choice.message.content or "").strip(), "huggingface", PRIMARY_MODEL, "huggingface"
 
-    client = _get_groq_client()
+    client, provider, base_url, used_model = _get_cloud_client(model_type, PRIMARY_MODEL)
     resp = await client.chat.completions.create(
-        model=PRIMARY_MODEL,
+        model=used_model,
         messages=messages,
         max_tokens=mt,
         temperature=0,
@@ -529,10 +538,10 @@ async def generate_primary(messages: List[Dict[str, str]], max_tokens: Optional[
     choice = resp.choices[0] if resp.choices else None
     if not choice or not getattr(choice, "message", None):
         raise RuntimeError("Primary model returned no message")
-    return (choice.message.content or "").strip()
+    return (choice.message.content or "").strip(), provider, used_model, base_url
 
 
-async def generate_shadow(messages: List[Dict[str, str]], max_tokens: Optional[int] = None) -> str:
+async def generate_shadow(messages: List[Dict[str, str]], max_tokens: Optional[int] = None, model_type: str = "groq") -> Tuple[str, str, str, str]:
     """
     Shadow LLM: sanitized user input + short safe summary only (no tools, no full rules).
     messages: [{"role":"user","content":"<sanitized summary>"}] typically
@@ -549,13 +558,14 @@ async def generate_shadow(messages: List[Dict[str, str]], max_tokens: Optional[i
         choice = resp.choices[0] if resp.choices else None
         if not choice or not getattr(choice, "message", None):
             raise RuntimeError("Shadow model returned no message")
-        return (choice.message.content or "").strip()
+        return (choice.message.content or "").strip(), "lmstudio", SHADOW_MODEL, SHADOW_BASE_URL or PRIMARY_BASE_URL or "http://localhost:1235/v1"
 
     if LLM_MODE == "transformers":
         model, tokenizer, device = _load_transformers_shadow()
-        return await asyncio.to_thread(
+        text = await asyncio.to_thread(
             _transformers_generate, model, tokenizer, device, messages, mt
         )
+        return text, "transformers", SHADOW_MODEL, "transformers"
 
     if bool(os.environ.get("SHADOW_BASE_URL", "").strip()):
         from openai import AsyncOpenAI
@@ -570,11 +580,11 @@ async def generate_shadow(messages: List[Dict[str, str]], max_tokens: Optional[i
         choice = resp.choices[0] if resp.choices else None
         if not choice or not getattr(choice, "message", None):
             raise RuntimeError("Shadow model returned no message")
-        return (choice.message.content or "").strip()
+        return (choice.message.content or "").strip(), "openai", SHADOW_MODEL, url
 
-    client = _get_groq_client()
+    client, provider, base_url, used_model = _get_cloud_client(model_type, SHADOW_MODEL)
     resp = await client.chat.completions.create(
-        model=SHADOW_MODEL,
+        model=used_model,
         messages=messages,
         max_tokens=mt,
         temperature=0,
@@ -583,7 +593,7 @@ async def generate_shadow(messages: List[Dict[str, str]], max_tokens: Optional[i
     choice = resp.choices[0] if resp.choices else None
     if not choice or not getattr(choice, "message", None):
         raise RuntimeError("Shadow model returned no message")
-    return (choice.message.content or "").strip()
+    return (choice.message.content or "").strip(), provider, used_model, base_url
 
 
 # --- Legacy wrappers (preserve call_primary_llm / call_shadow_llm for main.py) ---
@@ -594,13 +604,15 @@ async def call_primary_llm(system_prompt: str, user_message: str) -> str:
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message},
     ]
-    return await generate_primary(messages)
+    text, _, _, _ = await generate_primary(messages)
+    return text
 
 
 async def call_shadow_llm(user_message: str) -> str:
     """Shadow: sanitized user input only (no rules)."""
     messages = [{"role": "user", "content": user_message}]
-    return await generate_shadow(messages)
+    text, _, _, _ = await generate_shadow(messages)
+    return text
 
 
 def get_llm_status() -> dict:

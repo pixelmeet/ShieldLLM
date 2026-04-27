@@ -421,7 +421,7 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
     ]
 
     # 4. Hybrid Confidence-Based Execution
-    model_type = (req.modelType or "").strip().lower()
+    model_type = (req.modelType or "groq").strip().lower()
     
     retry_budget = {"remaining": 3}
     primary_meta = {}
@@ -439,7 +439,7 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
         shadow_output, shadow_data = "", {}
     else:
         # Tier 2: Primary LLM Evaluation
-        primary_text, primary_meta = await call_primary(primary_messages, retry_budget=retry_budget)
+        primary_text, primary_meta = await call_primary(primary_messages, retry_budget=retry_budget, model_type=model_type)
         if not primary_meta.get("ok"):
             # Return explicit degraded response if LLM fails after retries
             return JSONResponse(content={
@@ -463,7 +463,7 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
         # Tier 3: Conditional Shadow Validation (Ambiguous Risk)
         if 30 <= risk_score <= 80 or (risk_score < 30 and inj_score > 40):
             shadow_messages = [{"role": "user", "content": sanitized_user or user_input}]
-            s_text, shadow_meta = await call_shadow(shadow_messages, retry_budget=retry_budget)
+            s_text, shadow_meta = await call_shadow(shadow_messages, retry_budget=retry_budget, model_type=model_type)
             if shadow_meta.get("ok"):
                 shadow_ok = True
                 shadow_data = parse_llm_json(s_text)
@@ -504,7 +504,10 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
         "decision": defense_action,
         "llm_provider_used": getattr(primary_meta, "get", lambda x, y: y)("model", PRIMARY_MODEL) if primary_meta else "none",
         "latency_ms": getattr(primary_meta, "get", lambda x, y: y)("latency_ms", 0) if primary_meta else 0,
-        "error": getattr(primary_meta, "get", lambda x, y: y)("error_message", "") if primary_meta else ""
+        "error": getattr(primary_meta, "get", lambda x, y: y)("error_message", "") if primary_meta else "",
+        "model_type": getattr(primary_meta, "get", lambda x, y: y)("model_type", model_type) if primary_meta else model_type,
+        "provider": getattr(primary_meta, "get", lambda x, y: y)("provider", "none") if primary_meta else "none",
+        "model": getattr(primary_meta, "get", lambda x, y: y)("model", "none") if primary_meta else "none"
     }
     logger.info(json.dumps(log_data))
 
