@@ -49,7 +49,7 @@ You need the Next.js frontend and the Python defense service.
 **Terminal 1 (Defense Service):**
 ```bash
 cd defense_service
-uvicorn main:app --reload --port 5000
+ python -m uvicorn main:app --reload --port 5000
 ```
 
 **Terminal 2 (Frontend):**
