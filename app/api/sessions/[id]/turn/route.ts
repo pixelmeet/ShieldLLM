@@ -37,6 +37,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             defenseMode: session.defenseMode,
             policy: policyPayload,
             modelType: session.modelType,
+            sessionId: sessionId
         };
         console.log("Next.js → Forwarding to FastAPI:", payload);
         console.log(`[turn/POST] Calling defense service with modelType=${session.modelType}, defenseMode=${session.defenseMode}`);
@@ -51,26 +52,35 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         } catch (firstError: unknown) {
             const msg = firstError instanceof Error ? firstError.message : String(firstError);
             const isApiError = /invalid_api_key|incorrect api key|401|insufficient_quota|quota|429/i.test(msg);
-            // Only fall back to simulated for API key/quota issues. When primary/shadow LLM backends
-            // are down, surface the error so the user knows the models are not working.
             if (isApiError) {
-                console.log('[turn] API unavailable, retrying with simulated mode');
-                try {
-                    defenseResponse = await callDefenseService('/analyze', { ...payload, modelType: 'simulated' });
-                } catch (fallbackError) {
-                    console.error('[turn] Simulated fallback failed:', fallbackError);
-                    const hint = /invalid_api_key|401/i.test(msg)
-                        ? 'Set a valid API key (GROQ_API_KEY or OPENAI_API_KEY) in .env or .env.local, or create a new session with Model Backend: "Simulated (Demo, no API)".'
-                        : 'Check your API plan and billing, or create a new session with Model Backend: "Simulated (Demo, no API)".';
-                    return NextResponse.json(
-                        { error: 'Turn processing failed', detail: hint },
-                        { status: 502 }
-                    );
-                }
+                console.log('[turn] API unavailable, bubbling up error');
+                const hint = /invalid_api_key|401/i.test(msg)
+                    ? 'Set a valid API key (GROQ_API_KEY) in .env or .env.local.'
+                    : 'Check your API plan and billing.';
+                return NextResponse.json(
+                    { error: 'Turn processing failed', detail: hint },
+                    { status: 502 }
+                );
             } else {
                 throw firstError;
             }
         }
+
+        // Schema Validator
+        function validResponse(resp: any) {
+            if (!resp || typeof resp !== 'object') return false;
+            if (!resp.status || !resp.scores || typeof resp.scores.total !== 'number') return false;
+            return true;
+        }
+
+        if (defenseResponse.status !== 'degraded' && !validResponse(defenseResponse)) {
+            throw new Error("Invalid defense response");
+        }
+
+        if (defenseResponse.status !== 'degraded' && defenseResponse.scores.total > 70 && !['high', 'critical'].includes(defenseResponse.riskLevel)) {
+            throw new Error("Invalid defense response");
+        }
+
 
         // 3. Update Session State (Intent Graph & Trust Score)
         session.intentGraph = defenseResponse.updatedGraph;
@@ -97,7 +107,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
                 rerunWithCleaned: false
             },
             sanitizedText: defenseResponse.sanitizedText,
-            latencyMs: Math.floor(Math.random() * 200) + 300
+            latencyMs: defenseResponse.llm_latency_ms || defenseResponse.total_latency_ms || 0
         });
         console.log(`[turn/POST] DB → Turn saved successfully: ${turn._id}`);
 

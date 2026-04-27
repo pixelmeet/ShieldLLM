@@ -160,7 +160,7 @@ def _get_hf_client():
     return _hf_client
 
 
-# --- Cloud backend (Groq/OpenAI) ---
+# --- Cloud backend (Groq only) ---
 def _get_cloud_client(model_type: str, requested_model: str):
     from openai import AsyncOpenAI
     
@@ -168,17 +168,12 @@ def _get_cloud_client(model_type: str, requested_model: str):
         api_key = os.environ.get("GROQ_API_KEY", "").strip()
         base_url = "https://api.groq.com/openai/v1"
         provider = "groq"
-        model = "llama-3.1-8b-instant" # Fast Groq model
-    elif model_type == "openai":
-        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-        base_url = "https://api.openai.com/v1"
-        provider = "openai"
         model = requested_model
     else:
-        raise ValueError(f"Invalid or missing provider modelType: {model_type}")
+        raise ValueError(f"Invalid or missing provider: {model_type}")
 
-    if not api_key or "xxxx" in api_key.lower() or len(api_key) < 10 or (provider == "groq" and api_key.startswith("sk-proj-")):
-        raise ValueError(f"{provider.upper()}_API_KEY required or invalid. Wrong API key or provider.")
+    if not api_key or "xxxx" in api_key.lower() or len(api_key) < 10 or api_key.startswith("sk-proj-"):
+        raise ValueError(f"GROQ_API_KEY required or invalid.")
 
     return AsyncOpenAI(api_key=api_key, base_url=base_url), provider, base_url, model
 
@@ -350,7 +345,11 @@ async def call_primary(
     messages: List[Dict[str, str]],
     max_tokens: Optional[int] = None,
     retry_budget: Optional[Dict[str, int]] = None,
-    model_type: str = "groq"
+    model_type: str = "groq",
+    policy: Optional[Dict[str, Any]] = None,
+    intent_graph: Optional[Dict[str, Any]] = None,
+    session_id: str = "",
+    disable_cache: bool = False
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Primary LLM call. Returns (text, meta). Never raises.
@@ -365,11 +364,23 @@ async def call_primary(
         base_url = "huggingface"
     elif LLM_MODE == "transformers":
         base_url = "transformers"
-    cache_key = hashlib.md5(str(messages).encode()).hexdigest()
-    cached = llm_cache.get(f"primary_{cache_key}")
-    if cached:
-        llm_stats["cache_hits"] += 1
-        return cached
+    # Cache Isolation Fix: Include context in key
+    import json
+    cache_key = "disabled"
+    if not disable_cache and intent_graph and policy and session_id:
+        cache_data = {
+            "messages": messages,
+            "model": model_type,
+            "policy": policy,
+            "intent": intent_graph,
+            "user_id": session_id
+        }
+        cache_key = hashlib.sha256(json.dumps(cache_data, sort_keys=True).encode()).hexdigest()
+        cached = llm_cache.get(f"primary_{cache_key}")
+        if cached:
+            llm_stats["cache_hits"] += 1
+            return cached
+    
     llm_stats["cache_misses"] += 1
 
     budget = retry_budget if retry_budget is not None else {"remaining": 3}
@@ -416,7 +427,11 @@ async def call_shadow(
     messages: List[Dict[str, str]],
     max_tokens: Optional[int] = None,
     retry_budget: Optional[Dict[str, int]] = None,
-    model_type: str = "groq"
+    model_type: str = "groq",
+    policy: Optional[Dict[str, Any]] = None,
+    intent_graph: Optional[Dict[str, Any]] = None,
+    session_id: str = "",
+    disable_cache: bool = False
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Shadow LLM call. Returns (text, meta). Never raises.
@@ -430,11 +445,23 @@ async def call_shadow(
         base_url = "transformers"
     elif not USE_SHADOW_BASE_URL and not LLM_MODE:
         base_url = "groq"
-    cache_key = hashlib.md5(str(messages).encode()).hexdigest()
-    cached = llm_cache.get(f"shadow_{cache_key}")
-    if cached:
-        llm_stats["cache_hits"] += 1
-        return cached
+    # Cache Isolation Fix: Include context in key
+    import json
+    cache_key = "disabled"
+    if not disable_cache and intent_graph and policy and session_id:
+        cache_data = {
+            "messages": messages,
+            "model": model_type,
+            "policy": policy,
+            "intent": intent_graph,
+            "user_id": session_id
+        }
+        cache_key = hashlib.sha256(json.dumps(cache_data, sort_keys=True).encode()).hexdigest()
+        cached = llm_cache.get(f"shadow_{cache_key}")
+        if cached:
+            llm_stats["cache_hits"] += 1
+            return cached
+    
     llm_stats["cache_misses"] += 1
 
     budget = retry_budget if retry_budget is not None else {"remaining": 3}
@@ -563,7 +590,7 @@ async def generate_shadow(messages: List[Dict[str, str]], max_tokens: Optional[i
         choice = resp.choices[0] if resp.choices else None
         if not choice or not getattr(choice, "message", None):
             raise RuntimeError("Shadow model returned no message")
-        return (choice.message.content or "").strip(), "lmstudio", SHADOW_MODEL, SHADOW_BASE_URL or PRIMARY_BASE_URL or "http://localhost:1235/v1"
+        return (choice.message.content or "").strip(), "lmstudio", SHADOW_MODEL, SHADOW_BASE_URL or PRIMARY_BASE_URL or "http://localhost:1234/v1"
 
     if LLM_MODE == "transformers":
         model, tokenizer, device = _load_transformers_shadow()
@@ -572,22 +599,8 @@ async def generate_shadow(messages: List[Dict[str, str]], max_tokens: Optional[i
         )
         return text, "transformers", SHADOW_MODEL, "transformers"
 
-    if bool(os.environ.get("SHADOW_BASE_URL", "").strip()):
-        from openai import AsyncOpenAI
-        url = os.environ.get("SHADOW_BASE_URL", "").strip()
-        client = AsyncOpenAI(base_url=url, api_key=EMPTY_KEY)
-        resp = await client.chat.completions.create(
-            model=SHADOW_MODEL,
-            messages=messages,
-            max_tokens=mt,
-            temperature=0,
-        )
-        choice = resp.choices[0] if resp.choices else None
-        if not choice or not getattr(choice, "message", None):
-            raise RuntimeError("Shadow model returned no message")
-        return (choice.message.content or "").strip(), "openai", SHADOW_MODEL, url
-
     client, provider, base_url, used_model = _get_cloud_client(model_type, SHADOW_MODEL)
+
     print(">>> CALLING GROQ LLM (Shadow)")
     print("model:", used_model)
     print("base_url:", base_url)

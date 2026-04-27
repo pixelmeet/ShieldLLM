@@ -17,6 +17,7 @@ import asyncio
 import logging
 import uvicorn
 import json
+import os
 
 from canonicalize import progressive_canonicalize
 from intent_graph import build_intent_graph
@@ -26,9 +27,49 @@ from policy import decide_defense_action
 from llm_client import call_primary, call_shadow, get_llm_status, get_debug_llm_info, LLM_MODE as LLM_MODE_VAL, PRIMARY_MODEL
 from system_prompt import build_system_prompt
 from defense_controller import apply_defense
+import base64
+import urllib.parse
+import binascii
+import re
 
 app = FastAPI(title="ShieldLLM Defense Service", description="Dual-LLM Prompt Injection Defense")
 logger = logging.getLogger("shieldllm.defense")
+
+def try_decode(user_input: str) -> str:
+    """Attempt to decode base64, hex, or url-encoded payloads."""
+    # Base64
+    try:
+        if re.match(r'^[A-Za-z0-9+/]+={0,2}$', user_input.strip()) and len(user_input.strip()) % 4 == 0:
+            return base64.b64decode(user_input.strip()).decode('utf-8', errors='ignore')
+    except Exception: pass
+    # Hex
+    try:
+        if re.match(r'^[0-9a-fA-F]+$', user_input.strip()):
+            return bytes.fromhex(user_input.strip()).decode('utf-8', errors='ignore')
+    except Exception: pass
+    # URL-encoded
+    try:
+        decoded = urllib.parse.unquote(user_input)
+        if decoded != user_input:
+            return decoded
+    except Exception: pass
+    return ""
+
+def validate_response_contract(llm_data: Dict[str, Any], final_score: float, final_risk: str):
+    """Enforce strict scoring-to-risk mapping and check for LLM internal inconsistency."""
+    total = final_score
+    llm_risk = str(llm_data.get("riskLevel", "")).lower()
+    llm_score = float(llm_data.get("risk_score", 0))
+    
+    # 1. Internal Consistency: Did the LLM claim low risk but high score?
+    if llm_score > 70 and llm_risk == "low":
+        raise HTTPException(500, "Invalid model response: LLM internal risk mismatch")
+    
+    # 2. Safety Mapping: Is the final risk level appropriate for the score?
+    if total > 70 and final_risk not in ["high", "critical"]:
+        raise HTTPException(500, "Invalid model response: Risk mapping mismatch (High)")
+    if total < 30 and final_risk != "low":
+        raise HTTPException(500, "Invalid model response: Risk mapping mismatch (Low)")
 
 # --- Hardening Utilities ---
 from collections import defaultdict
@@ -132,20 +173,22 @@ class CircuitBreaker:
                 if time.time() - self.last_failure_time >= self.reset_timeout:
                     self.state = "HALF-OPEN"
                     self.successes = 0
-                    self.half_open_probes = 1
+                    self.probe_in_progress = True # HALF_OPEN allows ONLY ONE request
                     return True
                 return False
             if self.state == "HALF-OPEN":
-                if self.half_open_probes < self.success_threshold:
-                    self.half_open_probes += 1
-                    return True
-                return False
+                # Only allow one probe at a time
+                if getattr(self, "probe_in_progress", False):
+                    return False
+                self.probe_in_progress = True
+                return True
             return False
 
     async def record_success(self):
         async with self.lock:
             if self.state == "HALF-OPEN":
                 self.successes += 1
+                self.probe_in_progress = False
                 if self.successes >= self.success_threshold:
                     self.state = "CLOSED"
                     self.failures = 0
@@ -157,9 +200,9 @@ class CircuitBreaker:
         async with self.lock:
             self.failures += 1
             self.last_failure_time = time.time()
+            self.probe_in_progress = False
             if self.state == "HALF-OPEN" or self.failures >= self.failure_threshold:
                 self.state = "OPEN"
-                self.half_open_probes = 0
 
 circuit_breaker = CircuitBreaker()
 
@@ -220,6 +263,7 @@ class TurnRequest(BaseModel):
     defenseMode: str
     policy: Dict[str, Any]
     modelType: Optional[str] = None
+    sessionId: Optional[str] = None
 
 class DivergenceLog(BaseModel):
     divergenceScore: float
@@ -253,10 +297,21 @@ class AnalysisResponse(BaseModel):
     divergence_score: Optional[float] = None
     defense_action: Optional[str] = None
     log: Optional[Dict[str, Any]] = None
+    llm_called: bool = True
+    provider: str = "groq"
+    model: str = "llama3-8b-8192"
+    llm_latency_ms: float = 0.0
+    preprocessing_latency_ms: float = 0.0
+    total_latency_ms: float = 0.0
+    security_level: Optional[str] = "full"
+    divergence: float = 0.0
 
 
 @app.post("/analyze", response_model_exclude_none=False)
-async def analyze_turn(req: TurnRequest, x_forwarded_for: Optional[str] = Header(None, alias="X-Forwarded-For")):
+async def analyze_turn(
+    req: TurnRequest, 
+    x_forwarded_for: Optional[str] = Header(None, alias="X-Forwarded-For")
+):
     print(">>> ENTERED FASTAPI /analyze")
     print("modelType:", req.modelType)
     print("circuit_state:", circuit_breaker.state)
@@ -269,30 +324,31 @@ async def analyze_turn(req: TurnRequest, x_forwarded_for: Optional[str] = Header
     
     if not await rate_limiter.is_allowed(client_ip):
         logger.warning(json.dumps({
-            "request_id": req_id, "client_id": client_ip, "error": "Rate limit exceeded"
+            "request_id": req_id, "client_id": client_ip, "rate_limited": True, "error": "Rate limit exceeded",
+            "model_type": req.modelType or "groq", "llm_called": False, "circuit_state": circuit_breaker.state,
+            "status": "degraded", "latency_ms": 0
         }))
-        raise HTTPException(status_code=429, detail="Too many requests. Please wait a minute.")
+        return JSONResponse(status_code=429, content={"status": "error", "message": "Too many requests. Please wait a minute."})
 
     # Circuit Breaker check
     if not await circuit_breaker.acquire():
         logger.warning(json.dumps({
-            "request_id": req_id, "client_id": client_ip, "circuit_state": circuit_breaker.state, "error": "Circuit breaker OPEN"
+            "request_id": req_id, "client_id": client_ip, "circuit_state": circuit_breaker.state, "error": "Circuit breaker OPEN",
+            "model_type": req.modelType or "groq", "llm_called": False, "rate_limited": False,
+            "status": "degraded", "latency_ms": 0
         }))
-        return JSONResponse(status_code=200, content={
+        return JSONResponse(status_code=503, content={
             "status": "degraded",
-            "action": "unverified",
-            "riskLevel": "unknown",
-            "scores": {
-                "total": 0
-            },
-            "message": "LLM unavailable, request not verified"
+            "reason": "llm_unavailable",
+            "llm_called": False
         })
 
     try:
         # Prevent queue DoS by adding a timeout for execution
         try:
             async with asyncio.timeout(30.0): # Python 3.11+ 
-                res = await _analyze_turn_impl(req, req_id, client_ip)
+                start_total = time.perf_counter()
+                res = await _analyze_turn_impl(req, req_id, client_ip, start_total)
                 if isinstance(res, JSONResponse):
                     # Indicates LLM failure after retries
                     await circuit_breaker.record_failure()
@@ -306,7 +362,11 @@ async def analyze_turn(req: TurnRequest, x_forwarded_for: Optional[str] = Header
             }))
             await circuit_breaker.record_failure()
             await metrics.record_failure()
-            raise HTTPException(status_code=503, detail="Server overloaded. Please try again later.")
+            return JSONResponse(status_code=503, content={
+                "status": "degraded",
+                "reason": "llm_unavailable",
+                "llm_called": False
+            })
             
     except HTTPException:
         # Proper HTTP exceptions
@@ -395,16 +455,19 @@ def _make_containment_response(
         "divergence_score": divergence_score,
         "defense_action": "contain",
         "log": log_obj,
+        "llm_called": False,
+        "provider": "groq"
     }
 
 
-async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
+async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str, start_total: float):
     print(">>> Pipeline started")
     from fastapi.responses import JSONResponse
     user_input = req.userText or ""
 
     # 1. Preprocessing (Non-blocking)
     print(">>> Before heuristics")
+    prep_start = time.perf_counter()
     canonical_res = await asyncio.to_thread(progressive_canonicalize, user_input)
     canonical_text, canonical_signals = canonical_res
     sanitized_user = await asyncio.to_thread(sanitize_input, user_input)
@@ -418,6 +481,8 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
     graph_res = await asyncio.to_thread(build_intent_graph, conversation_for_graph)
     updated_graph, violations = graph_res
     all_signals = canonical_signals + violations
+    
+    preprocessing_latency_ms = (time.perf_counter() - prep_start) * 1000
 
     # 3. Prepare prompts
     system_prompt = build_system_prompt(updated_graph)
@@ -427,36 +492,53 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
     ]
 
     # 4. Hybrid Confidence-Based Execution
-    model_type = (req.modelType or "groq").strip().lower()
+    # PROVIDER ENFORCEMENT: Ignore client request, enforce server-side only
+    model_type = os.getenv("MODEL_TYPE", "groq").strip().lower()
+    if model_type != "groq":
+        raise HTTPException(500, "Invalid server configuration")
     
+    # ENCODED INJECTION DEFENSE
+    decoded = try_decode(user_input)
+    force_contain = False
+    if decoded:
+        # Re-run heuristics on BOTH original + decoded
+        canonical_res_dec = await asyncio.to_thread(progressive_canonicalize, decoded)
+        all_signals.extend(canonical_res_dec[1])
+        if any(word in decoded.lower() for word in ["ignore", "bypass", "override"]):
+            force_contain = True
+
     retry_budget = {"remaining": 3}
     primary_meta = {}
+    shadow_meta = {}
     risk_score = 0
     inj_score = injection_indicator_score(user_input)
+    if decoded:
+        inj_score = max(inj_score, injection_indicator_score(decoded))
     
-    if inj_score >= 80:
+    shadow_failed = False
+    disable_cache = (circuit_breaker.state != "CLOSED" or not req.intentGraph or not req.policy)
+
+    if force_contain or inj_score >= 80:
         primary_data = {"intent": "attack", "risk_score": 95, "action": "block", "answer": "Request blocked by safety filters."}
         primary_ok, shadow_ok = True, False
         primary_output, shadow_output, shadow_data = primary_data["answer"], "", {}
-    elif model_type == "simulated":
-        primary_output = f"[Simulated] I understand your request: {user_input[:100]}..."
-        primary_data = {"intent": "simulated", "risk_score": 0, "action": "allow", "answer": primary_output}
-        primary_ok, shadow_ok = True, True
-        shadow_output, shadow_data = "", {}
     else:
         # Tier 2: Primary LLM Evaluation
         print(">>> Before LLM call")
-        primary_text, primary_meta = await call_primary(primary_messages, retry_budget=retry_budget, model_type=model_type)
+        primary_text, primary_meta = await call_primary(
+            primary_messages, 
+            retry_budget=retry_budget, 
+            model_type=model_type,
+            policy=req.policy,
+            intent_graph=req.intentGraph,
+            session_id=req.sessionId or "unknown",
+            disable_cache=disable_cache
+        )
         if not primary_meta.get("ok"):
             # Return explicit degraded response if LLM fails after retries
-            return JSONResponse(content={
+            return JSONResponse(status_code=503, content={
                 "status": "degraded",
-                "action": "unverified",
-                "riskLevel": "unknown",
-                "scores": {
-                    "total": 0
-                },
-                "message": "LLM unavailable, request not verified"
+                "llm_called": False
             })
         
         primary_ok = True
@@ -470,18 +552,36 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
         # Tier 3: Conditional Shadow Validation (Ambiguous Risk)
         if 30 <= risk_score <= 80 or (risk_score < 30 and inj_score > 40):
             shadow_messages = [{"role": "user", "content": sanitized_user or user_input}]
-            s_text, shadow_meta = await call_shadow(shadow_messages, retry_budget=retry_budget, model_type=model_type)
+            s_text, shadow_meta = await call_shadow(
+                shadow_messages, 
+                retry_budget=retry_budget, 
+                model_type=model_type,
+                policy=req.policy,
+                intent_graph=req.intentGraph,
+                session_id=req.sessionId or "unknown",
+                disable_cache=disable_cache
+            )
             if shadow_meta.get("ok"):
                 shadow_ok = True
                 shadow_data = parse_llm_json(s_text)
                 shadow_output = shadow_data.get("answer", s_text)
+            else:
+                shadow_failed = True
 
     # 5. Advanced Divergence & Decision Logic
     thresholds = (req.policy or {}).get("divergenceThresholds") or {"low": 10, "medium": 30, "high": 60, "critical": 85}
     div_results = compute_advanced_divergence(primary_data, shadow_data)
     divergence_score = div_results["divergence_score"]
     
-    defense_action = decide_defense_action(divergence_score, thresholds, req.defenseMode or "active")
+    # Intent Graph Boost: If we detected forbidden intent, override risk to critical
+    if violations:
+        print(f">>> Intent Graph VIOLATION: {violations}")
+        divergence_score = max(divergence_score, 95.0)
+    
+    if force_contain:
+        defense_action = "contain"
+    else:
+        defense_action = decide_defense_action(divergence_score, thresholds, req.defenseMode or "active")
     
     # Tier 4: Blocking Override
     if primary_data.get("action") == "block" and divergence_score > thresholds["low"]:
@@ -489,6 +589,9 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
 
     risk_map = {"allow": "low", "clarify": "medium", "sanitize_rerun": "high", "contain": "critical"}
     risk_level = risk_map.get(defense_action, "medium")
+    
+    # RESPONSE VALIDATION LAYER
+    validate_response_contract(primary_data, divergence_score, risk_level)
     
     final_answer = apply_defense(defense_action, {
         "user_input": user_input,
@@ -501,20 +604,27 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
     defense_action_taken = defense_action in ("sanitize_rerun", "contain")
     rerun_with_cleaned = defense_action == "sanitize_rerun"
 
+    response_status = "partial_validation" if shadow_failed else "ok"
+    security_level = "reduced" if shadow_failed else "full"
+    
+    llm_called = not (inj_score >= 80 or force_contain)
+    llm_latency_ms = primary_meta.get("latency_ms", 0.0) + shadow_meta.get("latency_ms", 0.0)
+    total_latency_ms = (time.perf_counter() - start_total) * 1000
+
     log_data = {
         "request_id": req_id,
         "client_id": client_ip,
-        "cache_hit": getattr(primary_meta, "get", lambda x, y: y)("latency_ms", 1) < 5 if primary_meta else False,
         "circuit_state": circuit_breaker.state,
-        "risk_score": risk_score,
-        "divergence_score": divergence_score,
+        "rate_limited": False,
+        "status": response_status,
+        "llm_called": llm_called,
+        "latency_ms": total_latency_ms,
+        "model_type": primary_meta.get("model_type", model_type),
+        "provider": primary_meta.get("provider", "groq"),
+        "model": primary_meta.get("model", "llama3-8b-8192"),
         "decision": defense_action,
-        "llm_provider_used": getattr(primary_meta, "get", lambda x, y: y)("model", PRIMARY_MODEL) if primary_meta else "none",
-        "latency_ms": getattr(primary_meta, "get", lambda x, y: y)("latency_ms", 0) if primary_meta else 0,
-        "error": getattr(primary_meta, "get", lambda x, y: y)("error_message", "") if primary_meta else "",
-        "model_type": getattr(primary_meta, "get", lambda x, y: y)("model_type", model_type) if primary_meta else model_type,
-        "provider": getattr(primary_meta, "get", lambda x, y: y)("provider", "none") if primary_meta else "none",
-        "model": getattr(primary_meta, "get", lambda x, y: y)("model", "none") if primary_meta else "none"
+        "risk_score": risk_score,
+        "divergence_score": divergence_score
     }
     logger.info(json.dumps(log_data))
 
@@ -533,7 +643,7 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
     )
 
     result = AnalysisResponse(
-        status="ok",
+        status=response_status,
         message="OK",
         canonicalText=canonical_text,
         signals=all_signals,
@@ -547,8 +657,16 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str):
         divergenceLog=divergence_log,
         final_answer=final_answer,
         divergence_score=divergence_score,
+        divergence=divergence_score,
         defense_action=defense_action,
-        log=log_data
+        log=log_data,
+        llm_called=llm_called,
+        provider=primary_meta.get("provider", "groq"),
+        model=primary_meta.get("model", "llama3-8b-8192"),
+        llm_latency_ms=llm_latency_ms,
+        preprocessing_latency_ms=preprocessing_latency_ms,
+        total_latency_ms=total_latency_ms,
+        security_level=security_level
     )
     print(">>> FINAL RESPONSE:", result)
     return result
@@ -578,4 +696,5 @@ def debug_llm(x_debug_key: Optional[str] = Header(None, alias="X-Debug-Key")):
 
 if __name__ == "__main__":
     # Use port 5000 to match DEFENSE_SERVICE_URL and npm run dev:defense
+    # trigger reload 2
     uvicorn.run(app, host="0.0.0.0", port=5000)
