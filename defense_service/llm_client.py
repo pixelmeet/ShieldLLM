@@ -1,11 +1,22 @@
 """
-Dual-LLM client: Primary via Hugging Face (when PRIMARY_MODEL is org/name) or OpenAI; Shadow via OpenAI.
-Uses huggingface_hub.login(new_session=False) and HF InferenceClient for primary when PRIMARY_MODEL is a HF model id.
+Dual-LLM client: Primary (main chatbot) and Shadow via configurable backends.
+
+Supported modes (LLM_MODE env):
+- lmstudio: Use LM Studio local servers (OpenAI-compatible API). PRIMARY_BASE_URL, SHADOW_BASE_URL.
+  If only one server available, use same base_url with different PRIMARY_MODEL/SHADOW_MODEL (sequential).
+- transformers: Run models in-process with Hugging Face Transformers (Windows-friendly, no vLLM).
+
+Legacy support: When PRIMARY_MODEL is org/name (e.g. facebook/Meta-SecAlign-8B) and not lmstudio,
+  primary uses Hugging Face Inference. When PRIMARY_BASE_URL was set (vLLM), now use lmstudio mode.
+
+Robust fallback: call_primary/call_shadow return (text, meta) and never raise; meta.ok=False on failure.
 """
+import asyncio
 import logging
 import os
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from dotenv import load_dotenv
@@ -15,27 +26,89 @@ try:
 except Exception:
     pass
 
-from openai import AsyncOpenAI
-
 logger = logging.getLogger("shieldllm.defense.llm")
 
-# Primary: from env (e.g. facebook/Meta-SecAlign-8B for HF, or gpt-4o-mini for OpenAI)
+# --- Explicit LLM exceptions (for callers that need to distinguish) ---
+class LLMConnectionError(Exception):
+    """LLM endpoint unreachable (connection refused, DNS, etc)."""
+    pass
+
+class LLMTimeoutError(Exception):
+    """LLM request timed out (connect or read)."""
+    pass
+
+class LLMBadResponseError(Exception):
+    """LLM returned invalid or empty response."""
+    pass
+
+# --- Config from env ---
+LLM_MODE = (os.environ.get("LLM_MODE", "") or "").strip().lower()
+if LLM_MODE not in ("lmstudio", "transformers"):
+    LLM_MODE = ""
+
 PRIMARY_MODEL = os.environ.get("PRIMARY_MODEL", "gpt-4o-mini").strip()
-SHADOW_MODEL = os.environ.get("SHADOW_MODEL", "gpt-3.5-turbo").strip()
-# When set, primary uses vLLM at this URL (overrides HF/OpenAI)
+SHADOW_MODEL = os.environ.get("SHADOW_MODEL", "gpt-4o-mini").strip()
 PRIMARY_BASE_URL = os.environ.get("PRIMARY_BASE_URL", "").strip()
-# When set, shadow uses this URL (e.g. Phi-4 shadow server or vLLM at http://localhost:8001/v1)
 SHADOW_BASE_URL = os.environ.get("SHADOW_BASE_URL", "").strip()
-DEFAULT_MAX_TOKENS = 512
+MODEL_DEVICE = (os.environ.get("MODEL_DEVICE", "cpu")).strip().lower()
+if MODEL_DEVICE not in ("cuda", "cpu"):
+    MODEL_DEVICE = "cpu"
 
-# Use vLLM for primary when PRIMARY_BASE_URL is set (takes precedence)
+DEFAULT_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_TOKENS", "512"))
+EMPTY_KEY = "EMPTY"
+# Timeouts (seconds); 0 = no timeout
+LLM_CONNECT_TIMEOUT = float(os.environ.get("LLM_CONNECT_TIMEOUT", "15"))
+LLM_READ_TIMEOUT = float(os.environ.get("LLM_READ_TIMEOUT", "120"))
+HEALTH_CACHE_TTL = int(os.environ.get("HEALTH_CACHE_TTL", "30"))
+
+# Health check cache: { "primary": (ok: bool, ts: float), "shadow": ... }
+_health_cache: Dict[str, Tuple[bool, float]] = {}
+
+# LM Studio: when mode=lmstudio, use PRIMARY_BASE_URL (default 1234), SHADOW_BASE_URL (default 1235)
+# If only one LM Studio server, use same base_url with different models
+USE_SINGLE_LM_STUDIO = False
 USE_PRIMARY_BASE_URL = bool(PRIMARY_BASE_URL)
-# Use Hugging Face for primary when PRIMARY_MODEL looks like "org/model-name" (if not using base_url)
-USE_HF_PRIMARY = "/" in PRIMARY_MODEL and not USE_PRIMARY_BASE_URL
-# Use local shadow (Phi-4 server / vLLM) when SHADOW_BASE_URL is set
 USE_SHADOW_BASE_URL = bool(SHADOW_BASE_URL)
+if LLM_MODE == "lmstudio":
+    if not PRIMARY_BASE_URL:
+        PRIMARY_BASE_URL = "http://localhost:1234/v1"
+    if not SHADOW_BASE_URL or SHADOW_BASE_URL == PRIMARY_BASE_URL:
+        SHADOW_BASE_URL = PRIMARY_BASE_URL
+        USE_SINGLE_LM_STUDIO = True
+    USE_PRIMARY_BASE_URL = True
+    USE_SHADOW_BASE_URL = True
 
-# One-time HF login (uses HF_TOKEN from env or existing CLI login)
+# --- Client singletons ---
+_primary_client: Optional[Any] = None
+_shadow_client: Optional[Any] = None
+_transformer_primary = None
+_transformer_shadow = None
+
+
+def _get_lmstudio_primary_client():
+    """OpenAI SDK client for primary (LM Studio or any OpenAI-compatible server)."""
+    global _primary_client
+    if _primary_client is None:
+        from openai import AsyncOpenAI
+        url = PRIMARY_BASE_URL or "http://localhost:1234/v1"
+        _primary_client = AsyncOpenAI(base_url=url, api_key=EMPTY_KEY)
+    return _primary_client
+
+
+def _get_lmstudio_shadow_client():
+    """OpenAI SDK client for shadow (LM Studio). Uses separate client if different URL."""
+    global _shadow_client
+    if _shadow_client is None:
+        from openai import AsyncOpenAI
+        url = SHADOW_BASE_URL or PRIMARY_BASE_URL or "http://localhost:1235/v1"
+        _shadow_client = AsyncOpenAI(base_url=url, api_key=EMPTY_KEY)
+    return _shadow_client
+
+
+# --- Hugging Face primary (legacy when LLM_MODE empty and PRIMARY_MODEL has /, no PRIMARY_BASE_URL) ---
+USE_HF_PRIMARY = "/" in PRIMARY_MODEL and LLM_MODE != "lmstudio" and LLM_MODE != "transformers" and not USE_PRIMARY_BASE_URL
+_hf_client = None
+
 if USE_HF_PRIMARY:
     try:
         from huggingface_hub import login
@@ -44,35 +117,8 @@ if USE_HF_PRIMARY:
     except Exception as e:
         logger.warning("Hugging Face login skipped or failed: %s", e)
 
-_hf_client = None
-_primary_client: Optional[AsyncOpenAI] = None
-_shadow_client: Optional[AsyncOpenAI] = None
-
-# vLLM / Phi-4 shadow server use api_key="EMPTY" when no auth
-EMPTY_KEY = "EMPTY"
-
-
-def _get_primary_client() -> AsyncOpenAI:
-    """Primary: vLLM at PRIMARY_BASE_URL when set."""
-    global _primary_client
-    if _primary_client is None:
-        _primary_client = AsyncOpenAI(base_url=PRIMARY_BASE_URL, api_key=EMPTY_KEY)
-    return _primary_client
-
-
-def _get_shadow_client() -> AsyncOpenAI:
-    """Shadow: local Phi-4 server or vLLM when SHADOW_BASE_URL is set; else OpenAI API."""
-    global _shadow_client
-    if _shadow_client is None:
-        if USE_SHADOW_BASE_URL:
-            _shadow_client = AsyncOpenAI(base_url=SHADOW_BASE_URL, api_key=EMPTY_KEY)
-        else:
-            _shadow_client = _get_openai_client()
-    return _shadow_client
-
 
 def _get_hf_client():
-    """Lazy InferenceClient for Hugging Face primary model."""
     global _hf_client
     if _hf_client is None:
         from huggingface_hub import AsyncInferenceClient
@@ -81,103 +127,463 @@ def _get_hf_client():
     return _hf_client
 
 
-def _get_openai_client() -> AsyncOpenAI:
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError(
-            "OPENAI_API_KEY is required. Add it to .env or .env.local. "
-            "Get a key at https://platform.openai.com/account/api-keys"
-        )
-    if api_key in ("sk-...", "sk-proj-xxxx") or "xxxx" in api_key.lower() or len(api_key) < 30:
-        raise ValueError(
-            "OPENAI_API_KEY looks like a placeholder. Replace with a real key from "
-            "https://platform.openai.com/account/api-keys and add it to .env or .env.local"
-        )
-    return AsyncOpenAI(api_key=api_key)
+# --- OpenAI for shadow when not using LM Studio / transformers ---
+OPENAI_API_BASE = "https://api.openai.com/v1"
 
 
-async def call_primary_llm(system_prompt: str, user_message: str) -> str:
-    """
-    Primary LLM: vLLM (PRIMARY_BASE_URL) or Hugging Face (org/model) or OpenAI.
-    Receives full user input + rules. Returns assistant reply text.
-    """
-    max_tokens = int(os.environ.get("OPENAI_MAX_TOKENS", DEFAULT_MAX_TOKENS))
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
-    ]
-    if USE_PRIMARY_BASE_URL:
-        client = _get_primary_client()
-        response = await client.chat.completions.create(
-            model=PRIMARY_MODEL,
-            messages=messages,
-            max_tokens=max_tokens,
+def _get_openai_client():
+    from openai import AsyncOpenAI
+    prev_base = os.environ.get("OPENAI_BASE_URL")
+    if prev_base and any(x in prev_base.lower() for x in ("google", "gemini", "generativelanguage")):
+        logger.warning("Ignoring OPENAI_BASE_URL (Gemini/Google); shadow uses OpenAI only: %s", prev_base)
+    os.environ["OPENAI_BASE_URL"] = OPENAI_API_BASE
+    try:
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not api_key or api_key in ("sk-...", "sk-proj-xxxx") or "xxxx" in api_key.lower() or len(api_key) < 30:
+            raise ValueError(
+                "OPENAI_API_KEY required for shadow when not using LM Studio. "
+                "Get a key at https://platform.openai.com/account/api-keys"
+            )
+        return AsyncOpenAI(api_key=api_key, base_url=OPENAI_API_BASE)
+    finally:
+        if prev_base is not None:
+            os.environ["OPENAI_BASE_URL"] = prev_base
+        else:
+            os.environ.pop("OPENAI_BASE_URL", None)
+
+
+# --- Transformers backend (in-process) ---
+def _load_transformers_primary():
+    """Load primary model once at startup."""
+    global _transformer_primary
+    if _transformer_primary is not None:
+        return _transformer_primary
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        device = "cuda" if MODEL_DEVICE == "cuda" and torch.cuda.is_available() else "cpu"
+        logger.info("Loading primary model %s on %s (requested: %s)", PRIMARY_MODEL, device, MODEL_DEVICE)
+        tokenizer = AutoTokenizer.from_pretrained(PRIMARY_MODEL, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            PRIMARY_MODEL,
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            device_map="auto" if device == "cuda" else None,
+            trust_remote_code=True,
+        )
+        if device == "cpu":
+            model = model.to("cpu")
+        _transformer_primary = (model, tokenizer, device)
+    except Exception as e:
+        logger.exception("Failed to load primary transformers model: %s", e)
+        raise RuntimeError(f"Transformers primary model load failed: {e}") from e
+    return _transformer_primary
+
+
+def _load_transformers_shadow():
+    """Load shadow model (can be same or smaller model)."""
+    global _transformer_shadow
+    if _transformer_shadow is not None:
+        return _transformer_shadow
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        device = "cuda" if MODEL_DEVICE == "cuda" and torch.cuda.is_available() else "cpu"
+        model_id = SHADOW_MODEL if "/" in SHADOW_MODEL else PRIMARY_MODEL
+        if model_id == PRIMARY_MODEL and _transformer_primary is not None:
+            _transformer_shadow = _transformer_primary
+            return _transformer_shadow
+        logger.info("Loading shadow model %s on %s", model_id, device)
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            device_map="auto" if device == "cuda" else None,
+            trust_remote_code=True,
+        )
+        if device == "cpu":
+            model = model.to("cpu")
+        _transformer_shadow = (model, tokenizer, device)
+    except Exception as e:
+        logger.exception("Failed to load shadow transformers model: %s", e)
+        raise RuntimeError(f"Transformers shadow model load failed: {e}") from e
+    return _transformer_shadow
+
+
+def _transformers_generate(model, tokenizer, device: str, messages: List[Dict[str, str]], max_tokens: int = 512) -> str:
+    """Run chat completion with transformers."""
+    import torch
+    from transformers import TextIteratorStreamer
+    prompt_parts = []
+    for m in messages:
+        role = (m.get("role") or "user").lower()
+        content = (m.get("content") or "").strip()
+        if role == "system":
+            prompt_parts.append(f"System: {content}\n\n")
+        elif role == "user":
+            prompt_parts.append(f"User: {content}\n\n")
+        elif role == "assistant":
+            prompt_parts.append(f"Assistant: {content}\n\n")
+    prompt_parts.append("Assistant: ")
+    prompt = "".join(prompt_parts)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096).to(
+        model.device if hasattr(model, "device") else next(model.parameters()).device
+    )
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            do_sample=False,
             temperature=0,
+            pad_token_id=tokenizer.eos_token_id,
         )
-        choice = response.choices[0] if response.choices else None
-        if not choice or not getattr(choice, "message", None):
-            raise RuntimeError("Primary model returned no message")
-        return (choice.message.content or "").strip()
-        
+    response = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+    return response
+
+
+# --- Health checks (with caching) ---
+
+def _health_cache_valid(key: str) -> Optional[bool]:
+    """Return cached health result if still valid; else None."""
+    entry = _health_cache.get(key)
+    if not entry:
+        return None
+    ok, ts = entry
+    if time.time() - ts > HEALTH_CACHE_TTL:
+        return None
+    return ok
+
+
+def _health_cache_set(key: str, ok: bool) -> None:
+    _health_cache[key] = (ok, time.time())
+
+
+async def check_primary_health() -> bool:
+    """Probe primary endpoint; cache result for HEALTH_CACHE_TTL seconds."""
+    cached = _health_cache_valid("primary")
+    if cached is not None:
+        return cached
+    try:
+        text, meta = await call_primary(
+            [{"role": "user", "content": "Hi"}],
+            max_tokens=5,
+        )
+        ok = meta.get("ok", False)
+        _health_cache_set("primary", ok)
+        return ok
+    except Exception:
+        _health_cache_set("primary", False)
+        return False
+
+
+async def check_shadow_health() -> bool:
+    """Probe shadow endpoint; cache result for HEALTH_CACHE_TTL seconds."""
+    cached = _health_cache_valid("shadow")
+    if cached is not None:
+        return cached
+    try:
+        text, meta = await call_shadow(
+            [{"role": "user", "content": "Hi"}],
+            max_tokens=5,
+        )
+        ok = meta.get("ok", False)
+        _health_cache_set("shadow", ok)
+        return ok
+    except Exception:
+        _health_cache_set("shadow", False)
+        return False
+
+
+# --- Public API: call_primary / call_shadow return (text, meta), never raise ---
+
+def _meta(ok: bool, role: str, model: str, base_url: str = "", latency_ms: float = 0,
+          error_type: str = "", error_message: str = "") -> Dict[str, Any]:
+    """Build meta dict; sanitize error_message to avoid leaking internals."""
+    msg = error_message[:200] if error_message else ""
+    for s in ("api_key", "sk-", "token", "password", "secret"):
+        if s in msg.lower():
+            msg = "Request failed"
+            break
+    return {
+        "ok": ok,
+        "latency_ms": round(latency_ms, 2),
+        "model": model,
+        "base_url": base_url or "",
+        "error_type": error_type,
+        "error_message": msg,
+    }
+
+
+async def call_primary(
+    messages: List[Dict[str, str]],
+    max_tokens: Optional[int] = None,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    """
+    Primary LLM call. Returns (text, meta). Never raises.
+    On failure: text=None, meta.ok=False, meta.error_type, meta.error_message.
+    """
+    max_tok = max_tokens or DEFAULT_MAX_TOKENS
+    model = PRIMARY_MODEL
+    base_url = PRIMARY_BASE_URL or "http://localhost:1234/v1"
+    if LLM_MODE == "" and USE_PRIMARY_BASE_URL:
+        base_url = PRIMARY_BASE_URL
     elif USE_HF_PRIMARY:
-        client = _get_hf_client()
-        # HF AsyncInferenceClient chat_completion
-        response = await client.chat_completion(
+        base_url = "huggingface"
+    elif LLM_MODE == "transformers":
+        base_url = "transformers"
+    start = time.perf_counter()
+    try:
+        t = LLM_READ_TIMEOUT if LLM_READ_TIMEOUT > 0 else None
+        if t:
+            text = await asyncio.wait_for(
+                _generate_primary_impl(messages, max_tok),
+                timeout=t,
+            )
+        else:
+            text = await _generate_primary_impl(messages, max_tok)
+        elapsed = (time.perf_counter() - start) * 1000
+        return (text, _meta(True, "primary", model, base_url, elapsed))
+    except (asyncio.TimeoutError, TimeoutError):
+        elapsed = (time.perf_counter() - start) * 1000
+        return (None, _meta(False, "primary", model, base_url, elapsed, "LLMTimeoutError", "Request timed out"))
+    except (ConnectionError, OSError) as e:
+        elapsed = (time.perf_counter() - start) * 1000
+        return (None, _meta(False, "primary", model, base_url, elapsed, "LLMConnectionError", str(e)))
+    except Exception as e:
+        elapsed = (time.perf_counter() - start) * 1000
+        err_type = type(e).__name__
+        return (None, _meta(False, "primary", model, base_url, elapsed, err_type, str(e)))
+
+
+async def call_shadow(
+    messages: List[Dict[str, str]],
+    max_tokens: Optional[int] = None,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    """
+    Shadow LLM call. Returns (text, meta). Never raises.
+    """
+    max_tok = max_tokens or DEFAULT_MAX_TOKENS
+    model = SHADOW_MODEL
+    base_url = SHADOW_BASE_URL or PRIMARY_BASE_URL or "http://localhost:1235/v1"
+    if LLM_MODE == "" and USE_SHADOW_BASE_URL:
+        base_url = SHADOW_BASE_URL
+    elif LLM_MODE == "transformers":
+        base_url = "transformers"
+    elif not USE_SHADOW_BASE_URL and not LLM_MODE:
+        base_url = "openai"
+    start = time.perf_counter()
+    try:
+        t = LLM_READ_TIMEOUT if LLM_READ_TIMEOUT > 0 else None
+        if t:
+            text = await asyncio.wait_for(
+                _generate_shadow_impl(messages, max_tok),
+                timeout=t,
+            )
+        else:
+            text = await _generate_shadow_impl(messages, max_tok)
+        elapsed = (time.perf_counter() - start) * 1000
+        return (text, _meta(True, "shadow", model, base_url, elapsed))
+    except (asyncio.TimeoutError, TimeoutError):
+        elapsed = (time.perf_counter() - start) * 1000
+        return (None, _meta(False, "shadow", model, base_url, elapsed, "LLMTimeoutError", "Request timed out"))
+    except (ConnectionError, OSError) as e:
+        elapsed = (time.perf_counter() - start) * 1000
+        return (None, _meta(False, "shadow", model, base_url, elapsed, "LLMConnectionError", str(e)))
+    except Exception as e:
+        elapsed = (time.perf_counter() - start) * 1000
+        return (None, _meta(False, "shadow", model, base_url, elapsed, type(e).__name__, str(e)))
+
+
+async def _generate_primary_impl(messages: List[Dict[str, str]], max_tokens: int) -> str:
+    """Internal: can raise. Used by call_primary which catches."""
+    return await generate_primary(messages, max_tokens)
+
+async def _generate_shadow_impl(messages: List[Dict[str, str]], max_tokens: int) -> str:
+    return await generate_shadow(messages, max_tokens)
+
+
+# --- Public API ---
+
+async def generate_primary(messages: List[Dict[str, str]], max_tokens: Optional[int] = None) -> str:
+    """
+    Primary LLM: full conversation + intent constraints.
+    messages: [{"role":"system","content":"..."}, {"role":"user","content":"..."}]
+    """
+    mt = max_tokens if max_tokens is not None else DEFAULT_MAX_TOKENS
+    if LLM_MODE == "lmstudio" or (LLM_MODE == "" and USE_PRIMARY_BASE_URL):
+        client = _get_lmstudio_primary_client()
+        resp = await client.chat.completions.create(
             model=PRIMARY_MODEL,
             messages=messages,
-            max_tokens=max_tokens,
-            temperature=0.1, # HF sometimes needs non-zero
-            seed=42
-        )
-        choice = response.choices[0]
-        return (choice.message.content or "").strip()
-    else:
-        client = _get_openai_client()
-        response = await client.chat.completions.create(
-            model=PRIMARY_MODEL,
-            messages=messages,
-            max_tokens=max_tokens,
+            max_tokens=mt,
             temperature=0,
         )
-        choice = response.choices[0] if response.choices else None
+        choice = resp.choices[0] if resp.choices else None
         if not choice or not getattr(choice, "message", None):
             raise RuntimeError("Primary model returned no message")
         return (choice.message.content or "").strip()
 
+    if LLM_MODE == "transformers":
+        model, tokenizer, device = _load_transformers_primary()
+        return await asyncio.to_thread(
+            _transformers_generate, model, tokenizer, device, messages, mt
+        )
 
-async def call_shadow_llm(user_message: str) -> str:
-    """
-    Shadow LLM: receives sanitized user input only (no rules).
-    When SHADOW_BASE_URL is set, uses that (Phi-4 shadow server or vLLM); else OpenAI API.
-    """
-    client = _get_shadow_client()
-    response = await client.chat.completions.create(
-        model=SHADOW_MODEL,
-        messages=[{"role": "user", "content": user_message}],
-        max_tokens=int(os.environ.get("OPENAI_MAX_TOKENS", DEFAULT_MAX_TOKENS)),
+    if USE_HF_PRIMARY:
+        client = _get_hf_client()
+        resp = await client.chat_completion(
+            model=PRIMARY_MODEL,
+            messages=messages,
+            max_tokens=mt,
+            temperature=0.1,
+            seed=42,
+        )
+        choice = resp.choices[0]
+        return (choice.message.content or "").strip()
+
+    client = _get_openai_client()
+    resp = await client.chat.completions.create(
+        model=PRIMARY_MODEL,
+        messages=messages,
+        max_tokens=mt,
         temperature=0,
     )
-    choice = response.choices[0] if response.choices else None
+    choice = resp.choices[0] if resp.choices else None
+    if not choice or not getattr(choice, "message", None):
+        raise RuntimeError("Primary model returned no message")
+    return (choice.message.content or "").strip()
+
+
+async def generate_shadow(messages: List[Dict[str, str]], max_tokens: Optional[int] = None) -> str:
+    """
+    Shadow LLM: sanitized user input + short safe summary only (no tools, no full rules).
+    messages: [{"role":"user","content":"<sanitized summary>"}] typically
+    """
+    mt = max_tokens if max_tokens is not None else DEFAULT_MAX_TOKENS
+    if LLM_MODE == "lmstudio" or (LLM_MODE == "" and USE_SHADOW_BASE_URL):
+        client = _get_lmstudio_shadow_client()
+        resp = await client.chat.completions.create(
+            model=SHADOW_MODEL,
+            messages=messages,
+            max_tokens=mt,
+            temperature=0,
+        )
+        choice = resp.choices[0] if resp.choices else None
+        if not choice or not getattr(choice, "message", None):
+            raise RuntimeError("Shadow model returned no message")
+        return (choice.message.content or "").strip()
+
+    if LLM_MODE == "transformers":
+        model, tokenizer, device = _load_transformers_shadow()
+        return await asyncio.to_thread(
+            _transformers_generate, model, tokenizer, device, messages, mt
+        )
+
+    if bool(os.environ.get("SHADOW_BASE_URL", "").strip()):
+        from openai import AsyncOpenAI
+        url = os.environ.get("SHADOW_BASE_URL", "").strip()
+        client = AsyncOpenAI(base_url=url, api_key=EMPTY_KEY)
+        resp = await client.chat.completions.create(
+            model=SHADOW_MODEL,
+            messages=messages,
+            max_tokens=mt,
+            temperature=0,
+        )
+        choice = resp.choices[0] if resp.choices else None
+        if not choice or not getattr(choice, "message", None):
+            raise RuntimeError("Shadow model returned no message")
+        return (choice.message.content or "").strip()
+
+    client = _get_openai_client()
+    resp = await client.chat.completions.create(
+        model=SHADOW_MODEL,
+        messages=messages,
+        max_tokens=mt,
+        temperature=0,
+    )
+    choice = resp.choices[0] if resp.choices else None
     if not choice or not getattr(choice, "message", None):
         raise RuntimeError("Shadow model returned no message")
     return (choice.message.content or "").strip()
 
 
+# --- Legacy wrappers (preserve call_primary_llm / call_shadow_llm for main.py) ---
+
+async def call_primary_llm(system_prompt: str, user_message: str) -> str:
+    """Primary: full user input + rules (system prompt)."""
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+    return await generate_primary(messages)
+
+
+async def call_shadow_llm(user_message: str) -> str:
+    """Shadow: sanitized user input only (no rules)."""
+    messages = [{"role": "user", "content": user_message}]
+    return await generate_shadow(messages)
+
+
 def get_llm_status() -> dict:
     """Return whether real LLM is configured; for UI demo vs live mode."""
-    need_openai_key = (not USE_PRIMARY_BASE_URL and not USE_HF_PRIMARY) or not USE_SHADOW_BASE_URL
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if need_openai_key and not api_key:
-        return {"usingRealLLM": False, "reason": "OPENAI_API_KEY not set (required for primary or shadow)"}
     parts = []
-    if USE_PRIMARY_BASE_URL:
-        parts.append(f"Primary: {PRIMARY_BASE_URL} ({PRIMARY_MODEL})")
+    if LLM_MODE == "lmstudio" or (LLM_MODE == "" and USE_PRIMARY_BASE_URL):
+        url = PRIMARY_BASE_URL or "http://localhost:1234/v1"
+        parts.append(f"Primary: {url} ({PRIMARY_MODEL})")
+        if USE_SINGLE_LM_STUDIO or (LLM_MODE == "" and SHADOW_BASE_URL == url):
+            parts.append(f"Shadow: same server ({SHADOW_MODEL})")
+        else:
+            shadow_url = SHADOW_BASE_URL or PRIMARY_BASE_URL or "http://localhost:1235/v1"
+            parts.append(f"Shadow: {shadow_url} ({SHADOW_MODEL})")
+    elif LLM_MODE == "transformers":
+        parts.append(f"Transformers: Primary {PRIMARY_MODEL}, Shadow {SHADOW_MODEL}")
+        parts.append(f"Device: {MODEL_DEVICE}")
     elif USE_HF_PRIMARY:
         parts.append(f"Hugging Face primary: {PRIMARY_MODEL}")
+        if bool(os.environ.get("SHADOW_BASE_URL", "").strip()):
+            parts.append(f"Shadow: {os.environ.get('SHADOW_BASE_URL')} ({SHADOW_MODEL})")
+        else:
+            parts.append(f"Shadow: OpenAI ({SHADOW_MODEL})")
     else:
-        parts.append("OpenAI primary")
-    if USE_SHADOW_BASE_URL:
-        parts.append(f"Shadow: {SHADOW_BASE_URL} ({SHADOW_MODEL})")
-    else:
+        parts.append(f"OpenAI primary ({PRIMARY_MODEL})")
         parts.append(f"Shadow: OpenAI ({SHADOW_MODEL})")
+
+    need_openai = (
+        LLM_MODE not in ("lmstudio", "transformers")
+        and not USE_HF_PRIMARY
+    ) or (
+        LLM_MODE not in ("lmstudio", "transformers")
+        and not bool(os.environ.get("SHADOW_BASE_URL", "").strip())
+    )
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if need_openai and (not api_key or "xxxx" in api_key.lower() or len(api_key) < 30):
+        return {"usingRealLLM": False, "reason": "OPENAI_API_KEY not set (required for primary or shadow)"}
+
     return {"usingRealLLM": True, "reason": "; ".join(parts)}
+
+
+def get_debug_llm_info() -> dict:
+    """Protected debug: mode, confirms both paths exist, no secrets."""
+    mode = LLM_MODE or "legacy"
+    primary_ok = (
+        (LLM_MODE == "lmstudio" and bool(PRIMARY_BASE_URL)) or
+        (LLM_MODE == "" and USE_PRIMARY_BASE_URL) or
+        (LLM_MODE == "transformers") or
+        USE_HF_PRIMARY
+    )
+    shadow_ok = (
+        (LLM_MODE == "lmstudio") or
+        (LLM_MODE == "" and USE_SHADOW_BASE_URL) or
+        (LLM_MODE == "transformers") or
+        bool(os.environ.get("SHADOW_BASE_URL", "").strip()) or
+        bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    )
+    return {
+        "llm_mode": mode,
+        "primary_model": PRIMARY_MODEL,
+        "shadow_model": SHADOW_MODEL,
+        "primary_configured": primary_ok,
+        "shadow_configured": shadow_ok,
+        "single_lm_studio": USE_SINGLE_LM_STUDIO if LLM_MODE == "lmstudio" else False,
+        "device": MODEL_DEVICE if LLM_MODE == "transformers" else None,
+        "message": "Both primary and shadow inference paths are available." if get_llm_status().get("usingRealLLM") else "LLM not fully configured.",
+    }

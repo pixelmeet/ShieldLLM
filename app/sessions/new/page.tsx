@@ -70,7 +70,7 @@ export default function NewSession() {
                                 className="w-full bg-neutral-950 border border-white/10 rounded-lg px-4 py-3 focus:outline-none focus:border-cyan-500"
                             >
                                 <option value="simulated">Simulated (Demo, no API)</option>
-                                <option value="openai">OpenAI (GPT-4o-mini + GPT-3.5-turbo)</option>
+                                <option value="openai">OpenAI (main chatbot + shadow via API)</option>
                             </select>
                         </div>
                         <div>

@@ -19,12 +19,13 @@ ShieldLLM is a defense architecture for LLM agents that uses **Intent-Locked Exe
 Ensure `.env` is configured (created automatically):
 ```env
 MONGODB_URI=mongodb://localhost:27017/shieldllm
-DEFENSE_SERVICE_URL=http://localhost:8000
-# Optional: for real dual-path LLM inference (Primary: Meta-SecAlign-8B, Shadow: Phi-4 or Phi-3-mini)
-HUGGINGFACE_TOKEN=hf_...
-# Optional: SHADOW_USE_PHI3_MINI=true or SHADOW_MODEL=microsoft/phi-3-mini for limited resources
+DEFENSE_SERVICE_URL=http://localhost:5000
+LLM_MODE=lmstudio
+PRIMARY_BASE_URL=http://localhost:1234/v1
+PRIMARY_MODEL=your-model
+SHADOW_MODEL=your-shadow-model
 ```
-Without `HUGGINGFACE_TOKEN`, the defense service uses built-in mocks for demo.
+See `.env.example` for LM Studio and Transformers options. Use "Simulated" sessions for demo without LLMs.
 
 ### 2. Install Dependencies
 ```bash
@@ -43,28 +44,56 @@ npm run seed
 ```
 
 ### 4. Run Application
-You need the Next.js frontend and the Python defense service. For real shadow reasoning with **Phi-4**, also run the shadow server.
+You need the Next.js frontend and the Python defense service.
 
 **Terminal 1 (Defense Service):**
 ```bash
 cd defense_service
-uvicorn main:app --reload --port 8000
+uvicorn main:app --reload --port 5000
 ```
 
-**Terminal 2 (Optional — Phi-4 Shadow):**  
-If `SHADOW_BASE_URL=http://localhost:8001/v1` is set, run the Phi-4 shadow server so the defense service uses it instead of OpenAI for the shadow model:
-```bash
-pip install -r shadow_server/requirements.txt
-python -m shadow_server.main
-# Serves on http://localhost:8001; see shadow_server/README.md
-```
-
-**Terminal 3 (Frontend):**
+**Terminal 2 (Frontend):**
 ```bash
 npm run dev
 ```
 
+Or run both: `npm run dev:all`
+
 Visit `http://localhost:3000` to access the console.
+
+### 5. LLM Backends (Windows-Friendly, No vLLM)
+
+The defense service supports two modes via `LLM_MODE` in `.env`:
+
+**Option A: LM Studio** (recommended on Windows)
+1. Install [LM Studio](https://lmstudio.ai/)
+2. Download a model (e.g. Llama 3.2, Phi-2, Mistral)
+3. Start Local Server (default port 1234)
+4. In `.env`: `LLM_MODE=lmstudio`, `PRIMARY_BASE_URL=http://localhost:1234/v1`, `PRIMARY_MODEL=<your-model-name>`
+5. For shadow: either run a second LM Studio on port 1235, or use the same server with `SHADOW_BASE_URL=http://localhost:1234/v1` and a different `SHADOW_MODEL`
+
+**Option B: Transformers (In-Process)**
+1. In `.env`: `LLM_MODE=transformers`, `PRIMARY_MODEL=meta-llama/Llama-2-7b-chat-hf` (or smaller), `MODEL_DEVICE=cpu`
+2. `pip install transformers torch` in `defense_service/`
+3. Models load at startup; first request may be slow
+
+**Option C: Simulated (No LLM)**
+Create a new session and choose **Model Backend: "Simulated (Demo, no API)"** for placeholder responses.
+
+### 6. If Model Not Running (Degraded Behavior)
+
+The defense service continues to work when Primary or Shadow models are unavailable:
+
+| Scenario | Result | Response |
+|----------|--------|----------|
+| **Primary down** | Containment | Minimal safe message: "The analysis service is temporarily unavailable. Please try again in a moment." |
+| **Shadow down** | Degraded | Primary output returned; injection indicators in user input trigger `clarify`; otherwise `allow` |
+| **Both down** | Containment | Same as Primary down |
+| **Timeout** | Containment | Safe fallback; error logged (no stack trace to user) |
+
+- API always returns 200 with valid `final_answer`, `divergence_score`, `defense_action`, `riskLevel`.
+- Logs record `primary_ok`, `shadow_ok`, `primary_error`, `shadow_error` for debugging.
+- Set `LLM_READ_TIMEOUT` (seconds) and `HEALTH_CACHE_TTL` in `.env` to tune timeouts and health caching.
 
 ## 🧪 Demo Scenarios (Judge Script)
 
@@ -100,20 +129,19 @@ Visit `http://localhost:3000` to access the console.
 
 ## 📂 Project Structure
 - `/app`: Next.js App Router (Frontend)
-- `/backend`: Python FastAPI (ShieldLLM Backend — ILE with vLLM)
-- `/defense_service`: Python FastAPI (Dual-LLM Defense; primary HF/OpenAI, shadow OpenAI or Phi-4 server)
-- `/shadow_server`: Phi-4 shadow model server (transformers, OpenAI-compatible `/v1/chat/completions`)
+- `/backend`: Python FastAPI (ShieldLLM Backend — optional ILE backend)
+- `/defense_service`: Python FastAPI (Dual-LLM Defense; LM Studio, Transformers, or HF/OpenAI)
+- `/shadow_server`: Phi-4 shadow model server (optional)
 - `/lib`: Shared utilities (DB, Auth)
 - `/models`: Mongoose Schemas
-- `/scripts`: Database Seeding
+- `/scripts`: Database Seeding, E2E smoke test
 
-### ShieldLLM Backend (vLLM)
-
-The `/backend` app implements Intent-Locked Execution with dual vLLM endpoints. Run separately:
-
+### E2E Smoke Test
 ```bash
-cd backend && pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8100
+npm run seed
+npm run dev:all
+# In another terminal:
+pip install requests
+python scripts/e2e_smoke_test.py
 ```
-
-See `backend/README.md` for setup, env vars, and API examples.
+Uses `E2E_EMAIL=dev@shield.com` and `E2E_PASSWORD=dev` by default. Set `E2E_MODEL_TYPE=openai` to test with real LLMs.

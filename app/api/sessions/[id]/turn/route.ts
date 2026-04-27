@@ -131,6 +131,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         // User-friendly message for OpenAI API key / quota errors from defense service
         const isInvalidKey = /invalid_api_key|incorrect api key|401/i.test(detail);
         const isQuotaExceeded = /insufficient_quota|quota|429/i.test(detail);
+        const isGeminiError = /gemini|generativelanguage|generatecontent/i.test(detail);
+        if (isGeminiError) {
+            return NextResponse.json(
+                {
+                    error: 'Turn processing failed',
+                    detail: 'This app uses OPENAI_API_KEY with OpenAI only (not Gemini). Set OPENAI_API_KEY in .env to a key from https://platform.openai.com/account/api-keys, use PRIMARY_MODEL/SHADOW_MODEL like gpt-4o-mini, and remove any OPENAI_BASE_URL or Gemini proxy from .env — or create a session with Model Backend: "Simulated (Demo, no API)".',
+                },
+                { status: 502 }
+            );
+        }
         if (isInvalidKey || isQuotaExceeded) {
             const hint = isInvalidKey
                 ? 'Set a valid OPENAI_API_KEY in .env or .env.local (see https://platform.openai.com/account/api-keys), or create a new session with Model Backend: "Simulated (Demo, no API)".'

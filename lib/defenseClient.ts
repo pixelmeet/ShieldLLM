@@ -41,7 +41,7 @@ export async function callDefenseService(endpoint: string, data: any) {
             const detailLower = detail.toLowerCase();
             if (detailLower.includes('connection') || detailLower.includes('unreachable') || detailLower.includes('econnrefused')) {
                 throw new Error(
-                    `Primary or shadow LLM backend is not running. Start vLLM backends (see docs) or create a session with Model Backend: Simulated. (Defense service: ${detail})`
+                    `Primary or shadow LLM backend is not running. Start LM Studio (or set PRIMARY_BASE_URL) or create a session with Model Backend: Simulated. (Defense service: ${detail})`
                 );
             }
             throw new Error(`Defense service error: ${detail}`);

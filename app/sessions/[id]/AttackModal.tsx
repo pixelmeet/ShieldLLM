@@ -7,6 +7,14 @@ export default function AlertModal({ data, onClose }: { data: any, onClose: () =
     const scores = defense.scores || turn.scores || {};
     const signals = defense.signals || [];
 
+    // Derive Total Risk from individual scores (defense service formula: policy 50%, semantic 30%, reasoning 20%)
+    const sd = Math.max(0, Number(scores.semanticDrift ?? scores.semantic_drift ?? 0) || 0);
+    const ps = Math.max(0, Number(scores.policyStress ?? scores.policy_stress ?? 0) || 0);
+    const rm = Math.max(0, Number(scores.reasoningMismatch ?? scores.reasoning_mismatch ?? 0) || 0);
+    const totalRisk = Math.round(
+        Math.min(100, Math.max(0, (ps * 0.5) + (sd * 0.3) + (rm * 0.2)))
+    );
+
     return (
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
             <div className="glass-panel w-full max-w-2xl overflow-hidden shadow-2xl shadow-red-900/20 border-red-500/30">
@@ -25,12 +33,12 @@ export default function AlertModal({ data, onClose }: { data: any, onClose: () =
                         <div className="space-y-2">
                             <div className="text-xs uppercase text-neutral-500 font-bold tracking-wider">Detection Scores</div>
                             <div className="space-y-1">
-                                <ScoreBar label="Semantic Drift" val={scores.semanticDrift} />
-                                <ScoreBar label="Policy Stress" val={scores.policyStress} />
-                                <ScoreBar label="Reasoning Mismatch" val={scores.reasoningMismatch} />
+                                <ScoreBar label="Semantic Drift" val={sd} />
+                                <ScoreBar label="Policy Stress" val={ps} />
+                                <ScoreBar label="Reasoning Mismatch" val={rm} />
                                 <div className="pt-2 mt-2 border-t border-white/10 flex justify-between text-lg font-bold">
                                     <span>Total Risk</span>
-                                    <span className={scores.total > 70 ? 'text-red-500' : 'text-yellow-500'}>{scores.total}/100</span>
+                                    <span className={totalRisk > 70 ? 'text-red-500' : totalRisk > 30 ? 'text-yellow-500' : 'text-green-500'}>{totalRisk}/100</span>
                                 </div>
                             </div>
                         </div>

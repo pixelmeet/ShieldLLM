@@ -2,79 +2,103 @@
 
 ## What happens (flow)
 
-1. **Your `.env`** has:
-   - `PRIMARY_BASE_URL=http://localhost:8000/v1`
-   - `SHADOW_BASE_URL=http://localhost:8001/v1`
+1. **Your `.env`** has `LLM_MODE=lmstudio` or `PRIMARY_BASE_URL` / `SHADOW_BASE_URL` set.
 
-2. **Defense service** (Python) reads these. Because both are set, it uses **vLLM/local servers** for both primary and shadow (no OpenAI/Hugging Face for those).
+2. **Defense service** (Python) reads these. With LM Studio mode, it uses local servers for both primary and shadow.
 
 3. **When you send a message** in a session that uses a **real** model backend (not "Simulated"):
-   - The app calls the defense service `POST /analyze` with `modelType` = e.g. `openai` or whatever the session has.
-   - The defense service calls:
-     - **Primary:** `http://localhost:8000/v1` (chat completions)
-     - **Shadow:** `http://localhost:8001/v1` (chat completions)
+   - The app calls the defense service `POST /analyze` with `modelType` = e.g. `openai`.
+   - The defense service calls Primary and Shadow at the configured URLs.
 
-4. **If nothing is listening** on port **8000** or **8001**:
-   - The TCP connection is refused (e.g. `ConnectionRefusedError`).
-   - The defense service catches this and raises:
-     - *"Primary or shadow LLM backend is not running or unreachable. Start vLLM backends (PRIMARY_BASE_URL / SHADOW_BASE_URL in .env) or create a session with Model Backend: Simulated."*
-   - The Next.js app returns that message as a 502 to you.
-
-So the error appears **because**:
-- `PRIMARY_BASE_URL` and `SHADOW_BASE_URL` are set in `.env`, and
-- No server is actually running on those URLs (ports 8000 and 8001).
+4. **If nothing is listening** on the configured ports (e.g. 1234, 1235, 8000, 8001):
+   - The TCP connection is refused.
+   - The defense service raises: *"Primary or shadow LLM backend is not running or unreachable..."*
 
 ---
 
 ## How to fix it (pick one)
 
-### Option 1: Start the vLLM backends (use real local models)
+### Option 1: LM Studio (recommended on Windows)
 
-Run the script that starts primary and shadow on 8000 and 8001:
+vLLM does not support Windows. Use **LM Studio** instead:
 
-```powershell
-.\scripts\start_llms.ps1
-```
+1. Install [LM Studio](https://lmstudio.ai/)
+2. Download a model (e.g. Llama 3.2, Phi-2)
+3. Start Local Server (port 1234)
+4. In `.env`:
+   - `LLM_MODE=lmstudio`
+   - `PRIMARY_BASE_URL=http://localhost:1234/v1`
+   - `PRIMARY_MODEL=<exact model name from LM Studio>`
+   - `SHADOW_BASE_URL=http://localhost:1234/v1` (same server if only one)
+   - `SHADOW_MODEL=<same or different model>`
 
-Or start them manually (requires [vLLM](https://docs.vllm.ai/en/latest/) installed):
-
-- **Primary (port 8000):**  
-  `vllm serve facebook/Meta-SecAlign-8B --port 8000 --host 0.0.0.0`
-- **Shadow (port 8001):**  
-  `vllm serve microsoft/phi-4 --port 8001 --host 0.0.0.0`
-
-Wait until both servers are up, then use your session again.
-
----
-
-### Option 2: Use Hugging Face + OpenAI instead of vLLM (no local servers)
-
-If you don’t want to run vLLM, **stop** using the vLLM URLs for the defense service by clearing them in `.env`:
-
-1. Comment out or remove these lines in `.env`:
-   - `PRIMARY_BASE_URL=...`
-   - `SHADOW_BASE_URL=...`
-
-2. Keep:
-   - `PRIMARY_MODEL=facebook/Meta-SecAlign-8B` (or another HF model)
-   - `OPENAI_API_KEY=...` (for shadow, and for primary if you use an OpenAI model)
-   - `HF_TOKEN=...` (for Hugging Face primary)
-
-Then **restart the defense service**. It will use Hugging Face for primary and OpenAI for shadow, and the "Primary or shadow LLM backend is not running" error will go away (as long as HF/OpenAI are reachable).
+Restart the defense service. Both Primary and Shadow will run on the same LM Studio instance if URLs match.
 
 ---
 
-### Option 3: Use Simulated sessions (no real LLMs)
+### Option 2: Transformers (in-process)
+
+No local server needed; models run inside the defense service:
+
+1. In `.env`:
+   - `LLM_MODE=transformers`
+   - `PRIMARY_MODEL=meta-llama/Llama-2-7b-chat-hf` (or smaller)
+   - `MODEL_DEVICE=cpu`
+
+2. `pip install transformers torch` in `defense_service/`
+
+3. Restart the defense service. Models load at startup.
+
+---
+
+### Option 3: Hugging Face + OpenAI (cloud APIs)
+
+No local servers:
+
+1. In `.env`, **do not set** `PRIMARY_BASE_URL` or `SHADOW_BASE_URL`. Set `LLM_MODE` to empty or omit it.
+
+2. `PRIMARY_MODEL=facebook/Meta-SecAlign-8B` (Hugging Face)
+3. `SHADOW_MODEL=gpt-4o-mini` (OpenAI)
+4. `HF_TOKEN=...` and `OPENAI_API_KEY=...`
+
+---
+
+### Option 4: Simulated sessions (no real LLMs)
 
 Create a **new** session and choose **Model Backend: "Simulated (Demo, no API)"**.  
-For that session the defense service never calls primary/shadow URLs, so you won’t see this error. You’ll get placeholder "[Simulated] ..." responses instead of real model output.
+No LLM calls; placeholder responses only.
 
 ---
 
 ## Quick reference
 
-| .env state | Session type | Result |
-|------------|--------------|--------|
-| `PRIMARY_BASE_URL` + `SHADOW_BASE_URL` set | Real backend | Needs servers on 8000 & 8001; otherwise you get this error. |
-| Same | Simulated | No LLM calls; no error. |
-| Both URLs commented out | Real backend | Uses HF + OpenAI; no local servers needed. |
+| Config | Result |
+|--------|--------|
+| `LLM_MODE=lmstudio` + URLs set | Needs LM Studio on configured ports |
+| `LLM_MODE=transformers` | Models run in-process; no server needed |
+| URLs commented out, HF + OpenAI | Uses cloud APIs; no local servers |
+| Simulated session | No LLM; no error |
+
+## When Models Are Unavailable (Degraded / Containment)
+
+The defense service does **not** crash when models are down:
+
+- **Primary down**: Returns containment response; `decision_level=critical`, `defense_action=contain`
+- **Shadow down**: Returns primary output in degraded mode; uses heuristics for injection detection; may `clarify` if user input has injection indicators
+- **Both down**: Same as Primary down
+- **Timeout**: Containment; `LLM_READ_TIMEOUT` (default 120s) controls this
+
+Logs include `primary_ok`, `shadow_ok`, `primary_error`, `shadow_error` for debugging. Set `HEALTH_CACHE_TTL=30` to cache health checks.
+
+---
+
+## "Gemini API failed" or 404
+
+This app uses **OPENAI_API_KEY** with **OpenAI** only. It does **not** call Google Gemini.
+
+If you see Gemini 404 or `generateContent`:
+
+1. Use a key from [OpenAI API keys](https://platform.openai.com/account/api-keys)
+2. Set `PRIMARY_MODEL` and `SHADOW_MODEL` to OpenAI model names (e.g. `gpt-4o-mini`)
+3. Remove any `OPENAI_BASE_URL` pointing to Google/Gemini
+4. Or use Simulated mode

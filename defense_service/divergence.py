@@ -1,3 +1,4 @@
+import re
 from typing import Dict, Any, Optional
 
 DEFAULT_THRESHOLDS = {
@@ -6,6 +7,66 @@ DEFAULT_THRESHOLDS = {
     "high": 60,
     "critical": 85,
 }
+
+
+# Injection indicators in user input (for degraded scoring when shadow unavailable)
+INJECTION_INDICATOR_PATTERNS = [
+    r"\bignore\s+(?:all\s+)?(?:previous|prior|above|rules?)\s*(?:instructions?)?\b",
+    r"\bdisregard\s+(?:all\s+)?(?:previous|prior|rules?)\b",
+    r"\bbypass\s+(?:security|rules?|instructions?)\b",
+    r"\boverride\s+(?:previous|prior|rules?|instructions?)\b",
+    r"\bapprove\s+anyway\b",
+    r"\bapprove\s+without\s+review\b",
+    r"\bact\s+as\s+(?:a\s+)?system\b",
+    r"\byou\s+are\s+now\s+",
+    r"\bshow\s+(?:me\s+)?(?:the\s+)?system\s+prompt\b",
+    r"\breveal\s+(?:the\s+)?(?:system\s+)?(?:prompt|instructions?)\b",
+    r"\brole\s+change\b",
+    r"\bforget\s+(?:everything|all)\s+(?:above|prior)\b",
+]
+INJECTION_COMPILED = [re.compile(p, re.IGNORECASE) for p in INJECTION_INDICATOR_PATTERNS]
+# Obfuscation markers
+OBFUSCATION_MARKERS = ["base64", "decode:", "hex:", "\\u", "\\x", "&#"]
+
+def injection_indicator_score(user_input: str) -> float:
+    """
+    Score 0-100 based on injection-like phrases in user input.
+    Used when shadow is unavailable for degraded scoring.
+    """
+    if not user_input or not user_input.strip():
+        return 0.0
+    text = user_input.lower()
+    score = 0
+    for pat in INJECTION_COMPILED:
+        if pat.search(user_input):
+            score += 25
+    for m in OBFUSCATION_MARKERS:
+        if m in text:
+            score += 30
+    return min(score, 100)
+
+
+def compute_divergence_degraded(
+    primary_output: str,
+    user_input: str,
+    intent_graph: Optional[Dict[str, Any]] = None,
+    thresholds: Optional[Dict[str, float]] = None,
+) -> Dict[str, float]:
+    """
+    Degraded scoring when shadow is unavailable: use policy_stress(primary_output)
+    and injection_indicator_score(user_input). Returns same shape as compute_divergence.
+    """
+    thresholds = thresholds or DEFAULT_THRESHOLDS
+    analyzer = DivergenceAnalyzer(thresholds)
+    policy_stress = analyzer._calculate_policy_stress(primary_output or "")
+    inj_score = injection_indicator_score(user_input or "")
+    total = max(policy_stress, inj_score)
+    return {
+        "semanticDrift": round(min(total * 0.5, 100), 2),
+        "policyStress": round(policy_stress, 2),
+        "reasoningMismatch": round(inj_score * 0.5, 2),
+        "total": round(min(total, 100), 2),
+    }
 
 
 def compute_divergence(

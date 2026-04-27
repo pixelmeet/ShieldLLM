@@ -25,7 +25,12 @@ const TurnSchema = new Schema({
         divergenceScore: { type: Number, default: 0 },
         action: { type: String, default: '' },
         defenseActionTaken: { type: Boolean, default: false },
-        rerunWithCleaned: { type: Boolean, default: false }
+        rerunWithCleaned: { type: Boolean, default: false },
+        primary_ok: { type: Boolean },
+        shadow_ok: { type: Boolean },
+        primary_error: { type: String },
+        shadow_error: { type: String },
+        llm_mode: { type: String }
     },
     sanitizedText: { type: String, default: null },
     latencyMs: { type: Number, default: 0 },
