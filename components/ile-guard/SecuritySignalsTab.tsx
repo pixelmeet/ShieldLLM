@@ -3,16 +3,37 @@
 import React from 'react';
 import { TrendingUp, Activity, Shield, AlertCircle } from 'lucide-react';
 
-export default function SecuritySignalsTab() {
-    // Demo data
-    const intentDrift = 12;
-    const reasoningMismatch = 23;
-    const policyStress = 8;
+interface SecuritySignalsTabProps {
+    analysisResult?: any;
+}
 
-    const detectedPatterns = [
-        { name: 'Standard Query', severity: 'Low', firstSeen: '2m ago', color: 'var(--status-safe)' },
-        { name: 'Information Request', severity: 'Low', firstSeen: '2m ago', color: 'var(--status-safe)' }
-    ];
+export default function SecuritySignalsTab({ analysisResult }: SecuritySignalsTabProps) {
+    const hasData = !!analysisResult;
+    const divergenceScore = analysisResult?.scores?.total ?? analysisResult?.divergence_score ?? 0;
+    const signals = analysisResult?.signals || [];
+    const totalLatency = analysisResult?.total_latency_ms ?? 0;
+    const action = analysisResult?.action || 'allow';
+
+    const intentDrift = hasData ? Math.min(100, Math.round(divergenceScore * 0.8)) : 0;
+    const reasoningMismatch = hasData ? Math.round(divergenceScore) : 0;
+    const policyStress = hasData
+        ? Math.min(100, Math.round(signals.length * 15 + (divergenceScore > 60 ? 30 : 0)))
+        : 0;
+
+    const detectedPatterns = hasData
+        ? signals.map((signal: string, idx: number) => ({
+            name: signal.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+            severity: divergenceScore > 60 ? 'High' : divergenceScore > 30 ? 'Medium' : 'Low',
+            firstSeen: 'Just now',
+            color: divergenceScore > 60
+                ? 'var(--status-danger)'
+                : divergenceScore > 30
+                    ? 'var(--status-warning)'
+                    : 'var(--status-safe)'
+        }))
+        : [];
+
+    const threatsBlocked = hasData ? (action === 'contain' || action === 'block' ? 1 : 0) : 0;
 
     const getGaugeColor = (value: number) => {
         if (value < 30) return 'var(--status-safe)';
@@ -88,7 +109,7 @@ export default function SecuritySignalsTab() {
                             fontWeight: 'var(--font-bold)'
                         }}
                     >
-                        {value}
+                        {hasData ? value : '—'}
                     </div>
                     <div
                         className="w-full h-2 rounded-full overflow-hidden"
@@ -126,7 +147,7 @@ export default function SecuritySignalsTab() {
                     title="Intent Drift Score"
                     value={intentDrift}
                     icon={TrendingUp}
-                    trend="stable"
+                    trend={intentDrift > 30 ? 'up' : 'stable'}
                     description="Measures deviation from original user intent across conversation turns"
                 />
 
@@ -134,7 +155,7 @@ export default function SecuritySignalsTab() {
                     title="Reasoning Mismatch"
                     value={reasoningMismatch}
                     icon={Activity}
-                    trend="down"
+                    trend={reasoningMismatch > 30 ? 'up' : 'down'}
                     description="Percentage divergence between Primary and Shadow LLM reasoning"
                 />
 
@@ -142,7 +163,7 @@ export default function SecuritySignalsTab() {
                     title="Policy Boundary Stress"
                     value={policyStress}
                     icon={Shield}
-                    trend="down"
+                    trend={policyStress > 30 ? 'up' : 'down'}
                     description="Proximity to policy violation thresholds"
                 />
             </div>
@@ -161,7 +182,7 @@ export default function SecuritySignalsTab() {
                 </h3>
 
                 <div className="space-y-2">
-                    {detectedPatterns.map((pattern, idx) => (
+                    {detectedPatterns.length > 0 ? detectedPatterns.map((pattern: any, idx: number) => (
                         <div
                             key={idx}
                             className="flex items-center justify-between p-3 rounded-lg"
@@ -207,7 +228,19 @@ export default function SecuritySignalsTab() {
                                 {pattern.severity}
                             </div>
                         </div>
-                    ))}
+                    )) : (
+                        <div
+                            className="p-3 rounded-lg text-center"
+                            style={{
+                                background: 'var(--bg-secondary)',
+                                border: '1px solid var(--border-subtle)',
+                                fontSize: 'var(--text-sm)',
+                                color: 'var(--text-muted)'
+                            }}
+                        >
+                            {hasData ? 'No suspicious patterns detected' : 'Submit a prompt to detect patterns'}
+                        </div>
+                    )}
                 </div>
             </div>
 
@@ -239,7 +272,7 @@ export default function SecuritySignalsTab() {
                                 fontWeight: 'var(--font-bold)'
                             }}
                         >
-                            4
+                            {signals.length || 0}
                         </div>
                         <div
                             style={{
@@ -247,7 +280,7 @@ export default function SecuritySignalsTab() {
                                 color: 'var(--text-muted)'
                             }}
                         >
-                            Total Prompts
+                            Signals Found
                         </div>
                     </div>
                     <div className="text-center">
@@ -259,7 +292,7 @@ export default function SecuritySignalsTab() {
                                 fontWeight: 'var(--font-bold)'
                             }}
                         >
-                            1
+                            {threatsBlocked}
                         </div>
                         <div
                             style={{
@@ -279,7 +312,7 @@ export default function SecuritySignalsTab() {
                                 fontWeight: 'var(--font-bold)'
                             }}
                         >
-                            42ms
+                            {hasData ? `${Math.round(totalLatency)}ms` : '—'}
                         </div>
                         <div
                             style={{
@@ -287,7 +320,7 @@ export default function SecuritySignalsTab() {
                                 color: 'var(--text-muted)'
                             }}
                         >
-                            Avg Latency
+                            Latency
                         </div>
                     </div>
                 </div>

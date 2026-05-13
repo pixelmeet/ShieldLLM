@@ -1,19 +1,55 @@
 'use client';
 
 import React from 'react';
-import { ShieldCheck, Search, BarChart3, Brain, AlertTriangle } from 'lucide-react';
+import { ShieldCheck, Search, BarChart3, Brain, AlertTriangle, ShieldX } from 'lucide-react';
 
-export default function DefenseDecisionTab() {
-    // Demo data
-    const decision: string = 'ALLOW';
-    const confidence = 92;
+interface DefenseDecisionTabProps {
+    analysisResult?: any;
+}
 
-    const reasoningPoints = [
-        { icon: Search, text: 'No suspicious patterns detected in user prompt', type: 'pattern' },
-        { icon: BarChart3, text: 'Intent drift score within normal range (12%)', type: 'statistical' },
-        { icon: Brain, text: 'Primary and Shadow LLM outputs show low divergence (23%)', type: 'intent' },
-        { icon: ShieldCheck, text: 'No policy boundary violations detected', type: 'policy' }
-    ];
+export default function DefenseDecisionTab({ analysisResult }: DefenseDecisionTabProps) {
+    const hasData = !!analysisResult;
+    const decision = hasData ? (analysisResult.action || 'allow').toUpperCase() : 'ALLOW';
+    const divergenceScore = analysisResult?.scores?.total ?? analysisResult?.divergence_score ?? 0;
+    const confidence = hasData ? Math.max(0, Math.min(100, 100 - divergenceScore)) : 0;
+    const signals = analysisResult?.signals || [];
+    const riskLevel = analysisResult?.riskLevel || 'low';
+
+    const reasoningPoints = hasData
+        ? [
+            {
+                icon: Search,
+                text: signals.length > 0
+                    ? `Detected patterns: ${signals.slice(0, 3).join(', ')}`
+                    : 'No suspicious patterns detected in user prompt',
+                type: 'pattern'
+            },
+            {
+                icon: BarChart3,
+                text: `Divergence score: ${Math.round(divergenceScore)}% (${divergenceScore < 30 ? 'normal' : divergenceScore < 60 ? 'elevated' : 'critical'} range)`,
+                type: 'statistical'
+            },
+            {
+                icon: Brain,
+                text: analysisResult.shadowOutput
+                    ? `Primary and Shadow LLM outputs analyzed (divergence: ${Math.round(divergenceScore)}%)`
+                    : 'Shadow LLM not triggered — primary assessment sufficient',
+                type: 'intent'
+            },
+            {
+                icon: ShieldCheck,
+                text: riskLevel === 'low'
+                    ? 'No policy boundary violations detected'
+                    : `Policy stress detected — risk level: ${riskLevel}`,
+                type: 'policy'
+            }
+        ]
+        : [
+            { icon: Search, text: 'Submit a prompt to see pattern analysis', type: 'pattern' },
+            { icon: BarChart3, text: 'Awaiting divergence measurement', type: 'statistical' },
+            { icon: Brain, text: 'Dual-LLM reasoning comparison pending', type: 'intent' },
+            { icon: ShieldCheck, text: 'Policy boundary check pending', type: 'policy' }
+        ];
 
     const getDecisionConfig = () => {
         switch (decision) {
@@ -24,7 +60,15 @@ export default function DefenseDecisionTab() {
                     icon: ShieldCheck,
                     label: 'ALLOW'
                 };
+            case 'CLARIFY':
+                return {
+                    color: 'var(--status-warning)',
+                    bg: 'var(--status-warning-dim)',
+                    icon: AlertTriangle,
+                    label: 'CLARIFY'
+                };
             case 'SANITIZE':
+            case 'SANITIZE_RERUN':
                 return {
                     color: 'var(--status-warning)',
                     bg: 'var(--status-warning-dim)',
@@ -36,7 +80,7 @@ export default function DefenseDecisionTab() {
                 return {
                     color: 'var(--status-danger)',
                     bg: 'var(--status-danger-dim)',
-                    icon: ShieldCheck,
+                    icon: ShieldX,
                     label: decision
                 };
             default:
@@ -44,13 +88,31 @@ export default function DefenseDecisionTab() {
                     color: 'var(--status-neutral)',
                     bg: 'var(--status-neutral-dim)',
                     icon: ShieldCheck,
-                    label: 'UNKNOWN'
+                    label: hasData ? decision : 'PENDING'
                 };
         }
     };
 
     const config = getDecisionConfig();
     const DecisionIcon = config.icon;
+
+    const getActionDescription = () => {
+        switch (decision) {
+            case 'ALLOW':
+                return 'Request processed normally. Response generated and delivered to user without modifications.';
+            case 'CLARIFY':
+                return 'Ambiguous intent detected. User may be prompted for clarification before proceeding.';
+            case 'SANITIZE':
+            case 'SANITIZE_RERUN':
+                return 'Suspicious content detected and sanitized. Response regenerated with cleaned input.';
+            case 'CONTAIN':
+                return 'High-risk injection detected. Response blocked and replaced with safe containment message.';
+            case 'BLOCK':
+                return 'Critical threat detected. Request fully blocked by safety filters.';
+            default:
+                return hasData ? `Action taken: ${decision}` : 'Submit a prompt to see defense decisions.';
+        }
+    };
 
     return (
         <div className="space-y-6">
@@ -102,7 +164,7 @@ export default function DefenseDecisionTab() {
                                 fontWeight: 'var(--font-bold)'
                             }}
                         >
-                            {confidence}
+                            {hasData ? confidence : '—'}
                         </div>
                     </div>
 
@@ -114,7 +176,7 @@ export default function DefenseDecisionTab() {
                         <div
                             className="h-full transition-all"
                             style={{
-                                width: `${confidence}%`,
+                                width: `${hasData ? confidence : 0}%`,
                                 background: config.color,
                                 transition: 'width 800ms ease-out'
                             }}
@@ -198,7 +260,7 @@ export default function DefenseDecisionTab() {
                         lineHeight: '1.6'
                     }}
                 >
-                    Request processed normally. Response generated and delivered to user without modifications.
+                    {getActionDescription()}
                 </p>
             </div>
         </div>

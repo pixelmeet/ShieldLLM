@@ -35,6 +35,27 @@ import re
 app = FastAPI(title="ShieldLLM Defense Service", description="Dual-LLM Prompt Injection Defense")
 logger = logging.getLogger("shieldllm.defense")
 
+# --- Multi-turn Conversation Store (FIX 3) ---
+conversation_store: Dict[str, List[Dict[str, str]]] = {}
+MAX_SESSIONS = 1000
+MAX_HISTORY_TURNS = 10
+
+def _get_history(session_id: str) -> List[Dict[str, str]]:
+    return conversation_store.get(session_id, [])
+
+def _append_history(session_id: str, user_msg: str, assistant_msg: str):
+    if session_id not in conversation_store:
+        # Memory cap: evict oldest sessions if over limit
+        if len(conversation_store) >= MAX_SESSIONS:
+            keys_to_remove = list(conversation_store.keys())[:100]
+            for k in keys_to_remove:
+                conversation_store.pop(k, None)
+        conversation_store[session_id] = []
+    conversation_store[session_id].append({"role": "user", "content": user_msg})
+    conversation_store[session_id].append({"role": "assistant", "content": assistant_msg})
+    # Trim to last MAX_HISTORY_TURNS pairs (20 messages)
+    conversation_store[session_id] = conversation_store[session_id][-(MAX_HISTORY_TURNS * 2):]
+
 def try_decode(user_input: str) -> str:
     """Attempt to decode base64, hex, or url-encoded payloads."""
     # Base64
@@ -502,10 +523,13 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str, star
     effective_input = canonical_text if canonical_text else user_input
 
     # 2. Intent Graph Builder (Non-blocking)
+    session_id = req.sessionId or "unknown"
+    history = _get_history(session_id)
     conversation_for_graph = {
         "intent_graph": req.intentGraph,
         "user_text": user_input,
         "signals": canonical_signals,
+        "history": history,
     }
     graph_res = await asyncio.to_thread(build_intent_graph, conversation_for_graph)
     updated_graph, violations = graph_res
@@ -513,10 +537,11 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str, star
     
     preprocessing_latency_ms = (time.perf_counter() - prep_start) * 1000
 
-    # 3. Prepare prompts
+    # 3. Prepare prompts with conversation history
     system_prompt = build_system_prompt(updated_graph)
     primary_messages = [
         {"role": "system", "content": system_prompt},
+        *history[-(MAX_HISTORY_TURNS * 2):],
         {"role": "user", "content": user_input},
     ]
 
@@ -721,6 +746,8 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str, star
         total_latency_ms=total_latency_ms,
         security_level=security_level
     )
+    # Store conversation turn for multi-turn history
+    _append_history(session_id, user_input, final_answer)
     print(">>> FINAL RESPONSE:", result)
     return result
 
@@ -734,6 +761,13 @@ def health_check():
 @app.get("/llm-status")
 def llm_status():
     return get_llm_status()
+
+
+@app.delete("/session/{session_id}/history")
+def clear_session_history(session_id: str):
+    """Clear conversation history for a session to prevent memory leaks."""
+    removed = conversation_store.pop(session_id, None)
+    return {"status": "ok", "cleared": removed is not None}
 
 
 @app.get("/debug/llm")

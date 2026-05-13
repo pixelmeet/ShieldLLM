@@ -5,14 +5,16 @@ from typing import List, Dict, Any, Optional, Tuple
 def build_intent_graph(conversation: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     """
     Build/update the intent graph from conversation state.
-    conversation: dict with "intent_graph" (optional), "user_text" (str), "signals" (optional list).
+    conversation: dict with "intent_graph" (optional), "user_text" (str), "signals" (optional list),
+                  "history" (optional list of {"role","content"} dicts for multi-turn context).
     Returns (updated_graph, violations).
     """
     graph = copy.deepcopy(conversation.get("intent_graph") or {})
     user_text = conversation.get("user_text") or ""
     signals = conversation.get("signals") or []
+    history = conversation.get("history") or []
     builder = IntentGraphBuilder(graph)
-    updated_graph, violations = builder.update(user_text, signals)
+    updated_graph, violations = builder.update(user_text, signals, history)
     return updated_graph, violations
 
 
@@ -30,9 +32,9 @@ class IntentGraphBuilder:
         if "history" not in self.graph or self.graph["history"] is None:
             self.graph["history"] = []
 
-    def update(self, user_text: str, signals: List[str]) -> Dict[str, Any]:
+    def update(self, user_text: str, signals: List[str], history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
         """
-        Update the intent graph based on new user input and signals.
+        Update the intent graph based on new user input, signals, and conversation history.
         """
         current_turn = len(self.graph.get("history", [])) + 1
         
@@ -51,7 +53,26 @@ class IntentGraphBuilder:
             suspicion_level += 50
             violations.append(f"forbidden_intent_{extracted_intent}")
 
-        # 3. Update History Node
+        # 3. Multi-turn drift detection using conversation history
+        if history and len(history) >= 2:
+            past_user_texts = [m["content"].lower() for m in history if m.get("role") == "user"]
+            current_lower = user_text.lower()
+            
+            # Detect escalation: earlier turns claim identity/role, later turns request secrets
+            role_claim_keywords = ["researcher", "developer", "admin", "security", "study", "authorized", "i am a", "i work"]
+            secret_request_keywords = ["system prompt", "reveal", "show me", "hidden", "instruction", "secret", "internal", "confidential"]
+            
+            has_role_claim = any(
+                any(kw in msg for kw in role_claim_keywords)
+                for msg in past_user_texts
+            )
+            has_secret_request = any(kw in current_lower for kw in secret_request_keywords)
+            
+            if has_role_claim and has_secret_request:
+                suspicion_level += 40
+                violations.append("multi_turn_escalation")
+
+        # 4. Update History Node
         new_node = {
             "turn": current_turn,
             "intent": extracted_intent,

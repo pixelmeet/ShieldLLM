@@ -5,7 +5,11 @@ import ExecutionPathTab from './ExecutionPathTab';
 import DefenseDecisionTab from './DefenseDecisionTab';
 import SecuritySignalsTab from './SecuritySignalsTab';
 
-export default function DefenseAnalysisPanel() {
+interface DefenseAnalysisPanelProps {
+    analysisResult?: any;
+}
+
+export default function DefenseAnalysisPanel({ analysisResult }: DefenseAnalysisPanelProps) {
     const [activeTab, setActiveTab] = useState<'execution' | 'decision' | 'signals'>('execution');
 
     const tabs = [
@@ -51,9 +55,9 @@ export default function DefenseAnalysisPanel() {
 
             {/* Tab Content */}
             <div className="flex-1 overflow-y-auto">
-                {activeTab === 'execution' && <ExecutionPathTab />}
-                {activeTab === 'decision' && <DefenseDecisionTab />}
-                {activeTab === 'signals' && <SecuritySignalsTab />}
+                {activeTab === 'execution' && <ExecutionPathTab analysisResult={analysisResult} />}
+                {activeTab === 'decision' && <DefenseDecisionTab analysisResult={analysisResult} />}
+                {activeTab === 'signals' && <SecuritySignalsTab analysisResult={analysisResult} />}
             </div>
         </div>
     );

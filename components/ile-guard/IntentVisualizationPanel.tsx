@@ -4,7 +4,11 @@ import React, { useState } from 'react';
 import IntentGraph from './IntentGraph';
 import { GitBranch, Clock } from 'lucide-react';
 
-export default function IntentVisualizationPanel() {
+interface IntentVisualizationPanelProps {
+    graphData?: Record<string, any>;
+}
+
+export default function IntentVisualizationPanel({ graphData }: IntentVisualizationPanelProps) {
     const [viewMode, setViewMode] = useState<'graph' | 'timeline'>('graph');
 
     return (
@@ -66,7 +70,7 @@ export default function IntentVisualizationPanel() {
             {/* Visualization Area */}
             <div className="flex-1 overflow-hidden">
                 {viewMode === 'graph' ? (
-                    <IntentGraph />
+                    <IntentGraph graphData={graphData} />
                 ) : (
                     <div className="h-full flex items-center justify-center">
                         <p style={{ color: 'var(--text-muted)', fontSize: 'var(--text-sm)' }}>

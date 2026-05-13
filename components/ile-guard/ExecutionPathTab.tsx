@@ -2,29 +2,17 @@
 
 import React from 'react';
 
-export default function ExecutionPathTab() {
-    // Demo data
-    const primaryOutput = `Based on your query, I can provide information about the weather. To give you accurate details, I would need to know your location. 
+interface ExecutionPathTabProps {
+    analysisResult?: any;
+}
 
-Weather services typically provide:
-- Current temperature
-- Precipitation forecast
-- Wind conditions
-- Humidity levels
-
-Would you like to share your location?`;
-
-    const shadowOutput = `I can help you with weather information. However, I need your location to provide accurate data.
-
-Available weather metrics:
-- Temperature readings
-- Forecast predictions
-- Wind speed and direction
-- Atmospheric conditions
-
-Please provide your location for specific details.`;
-
-    const divergenceScore = 23;
+export default function ExecutionPathTab({ analysisResult }: ExecutionPathTabProps) {
+    const primaryOutput = analysisResult?.primaryOutput || analysisResult?.final_answer || '';
+    const shadowOutput = analysisResult?.shadowOutput || '';
+    const divergenceScore = analysisResult?.scores?.total ?? analysisResult?.divergence_score ?? 0;
+    const llmLatency = analysisResult?.llm_latency_ms ?? 0;
+    const totalLatency = analysisResult?.total_latency_ms ?? 0;
+    const hasData = !!analysisResult;
 
     const getDivergenceColor = () => {
         if (divergenceScore < 30) return 'var(--status-safe)';
@@ -59,7 +47,9 @@ Please provide your location for specific details.`;
                         marginTop: 'var(--space-1)'
                     }}
                 >
-                    Primary and Shadow LLM outputs analyzed for divergence
+                    {hasData
+                        ? 'Live analysis from Primary and Shadow LLMs'
+                        : 'Submit a prompt to see real dual-LLM analysis'}
                 </p>
             </div>
 
@@ -101,17 +91,17 @@ Please provide your location for specific details.`;
                                 lineHeight: '1.6'
                             }}
                         >
-                            {primaryOutput}
+                            {primaryOutput || 'Awaiting analysis...'}
                         </pre>
                         <div
                             className="mt-4 pt-3 border-t flex items-center justify-between"
                             style={{ borderColor: 'var(--border-subtle)' }}
                         >
                             <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
-                                Tokens: 87
+                                Provider: {analysisResult?.provider || '—'}
                             </span>
                             <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
-                                Latency: 42ms
+                                Latency: {hasData ? `${Math.round(llmLatency)}ms` : '—'}
                             </span>
                         </div>
                     </div>
@@ -153,17 +143,17 @@ Please provide your location for specific details.`;
                                 lineHeight: '1.6'
                             }}
                         >
-                            {shadowOutput}
+                            {shadowOutput || (hasData ? 'Shadow not triggered (low ambiguity)' : 'Awaiting analysis...')}
                         </pre>
                         <div
                             className="mt-4 pt-3 border-t flex items-center justify-between"
                             style={{ borderColor: 'var(--border-subtle)' }}
                         >
                             <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
-                                Tokens: 72
+                                Security: {analysisResult?.security_level || '—'}
                             </span>
                             <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
-                                Latency: 38ms
+                                Total: {hasData ? `${Math.round(totalLatency)}ms` : '—'}
                             </span>
                         </div>
                     </div>
@@ -186,7 +176,7 @@ Please provide your location for specific details.`;
                         fontWeight: 'var(--font-bold)'
                     }}
                 >
-                    {divergenceScore}%
+                    {hasData ? `${Math.round(divergenceScore)}%` : '—'}
                 </div>
                 <div
                     style={{
@@ -204,7 +194,13 @@ Please provide your location for specific details.`;
                         color: 'var(--text-muted)'
                     }}
                 >
-                    Low divergence indicates consistent reasoning between models
+                    {hasData
+                        ? (divergenceScore < 30
+                            ? 'Low divergence indicates consistent reasoning between models'
+                            : divergenceScore < 60
+                                ? 'Moderate divergence — shadow reasoning detected discrepancies'
+                                : 'High divergence — potential injection or manipulation detected')
+                        : 'Submit a prompt to measure divergence'}
                 </p>
             </div>
         </div>

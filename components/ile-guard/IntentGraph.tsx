@@ -2,7 +2,11 @@
 
 import React, { useEffect, useRef } from 'react';
 
-export default function IntentGraph() {
+interface IntentGraphProps {
+    graphData?: Record<string, any>;
+}
+
+export default function IntentGraph({ graphData }: IntentGraphProps) {
     const canvasRef = useRef<HTMLCanvasElement>(null);
 
     useEffect(() => {
@@ -16,21 +20,47 @@ export default function IntentGraph() {
         canvas.width = canvas.offsetWidth;
         canvas.height = canvas.offsetHeight;
 
-        // Demo intent graph data
-        const nodes = [
-            { id: 'current', label: 'User Query', x: canvas.width / 2, y: canvas.height / 2, type: 'current' },
-            { id: 'search', label: 'Search Data', x: canvas.width / 2 - 150, y: canvas.height / 2 - 100, type: 'allowed' },
-            { id: 'format', label: 'Format Response', x: canvas.width / 2 + 150, y: canvas.height / 2 - 100, type: 'allowed' },
-            { id: 'admin', label: 'Admin Access', x: canvas.width / 2 - 150, y: canvas.height / 2 + 100, type: 'forbidden' },
-            { id: 'system', label: 'System Prompt', x: canvas.width / 2 + 150, y: canvas.height / 2 + 100, type: 'forbidden' },
-        ];
+        const allowedActions = graphData?.allowed || ['read_code', 'explain_vuln', 'suggest_fix', 'general_chat'];
+        const forbiddenActions = graphData?.forbidden || ['override_policy', 'reveal_system', 'rce_attempt', 'obfuscation_attempt'];
+        const goal = graphData?.goal || 'User Query';
 
-        const edges = [
-            { from: 'current', to: 'search', type: 'allowed' },
-            { from: 'current', to: 'format', type: 'allowed' },
-            { from: 'current', to: 'admin', type: 'forbidden' },
-            { from: 'current', to: 'system', type: 'forbidden' },
-        ];
+        // Build nodes dynamically from graph data
+        const nodes: { id: string; label: string; x: number; y: number; type: 'current' | 'allowed' | 'forbidden' }[] = [];
+        const edges: { from: string; to: string; type: 'allowed' | 'forbidden' }[] = [];
+
+        // Center node
+        nodes.push({ id: 'current', label: goal, x: canvas.width / 2, y: canvas.height / 2, type: 'current' });
+
+        // Place allowed nodes on top arc
+        const maxDisplay = 4;
+        const displayAllowed = allowedActions.slice(0, maxDisplay);
+        const displayForbidden = forbiddenActions.slice(0, maxDisplay);
+
+        displayAllowed.forEach((action: string, i: number) => {
+            const angle = Math.PI + (Math.PI / (displayAllowed.length + 1)) * (i + 1);
+            const radius = Math.min(canvas.width, canvas.height) * 0.35;
+            nodes.push({
+                id: `allowed-${i}`,
+                label: action.replace(/_/g, ' '),
+                x: canvas.width / 2 + Math.cos(angle) * radius,
+                y: canvas.height / 2 + Math.sin(angle) * radius,
+                type: 'allowed'
+            });
+            edges.push({ from: 'current', to: `allowed-${i}`, type: 'allowed' });
+        });
+
+        displayForbidden.forEach((action: string, i: number) => {
+            const angle = (Math.PI / (displayForbidden.length + 1)) * (i + 1);
+            const radius = Math.min(canvas.width, canvas.height) * 0.35;
+            nodes.push({
+                id: `forbidden-${i}`,
+                label: action.replace(/_/g, ' '),
+                x: canvas.width / 2 + Math.cos(angle) * radius,
+                y: canvas.height / 2 + Math.sin(angle) * radius,
+                type: 'forbidden'
+            });
+            edges.push({ from: 'current', to: `forbidden-${i}`, type: 'forbidden' });
+        });
 
         // Clear canvas
         ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--bg-primary');
@@ -90,13 +120,13 @@ export default function IntentGraph() {
 
             // Node label
             ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--text-primary');
-            ctx.font = '12px Inter, sans-serif';
+            ctx.font = '11px Inter, sans-serif';
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
             ctx.fillText(node.label, node.x, node.y + (node.type === 'current' ? 60 : 50));
         });
 
-    }, []);
+    }, [graphData]);
 
     return (
         <div className="h-full w-full rounded-lg overflow-hidden" style={{ background: 'var(--bg-secondary)' }}>
