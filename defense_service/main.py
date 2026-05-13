@@ -484,12 +484,22 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str, star
     from fastapi.responses import JSONResponse
     user_input = req.userText or ""
 
+    # Enforce input length limit
+    max_chars = int(os.getenv("INPUT_MAX_CHARS", "20000"))
+    if len(user_input) > max_chars:
+        return JSONResponse(status_code=400, content={
+            "status": "error",
+            "message": f"Input too long. Maximum {max_chars} characters allowed."
+        })
+
     # 1. Preprocessing (Non-blocking)
     print(">>> Before heuristics")
     prep_start = time.perf_counter()
     canonical_res = await asyncio.to_thread(progressive_canonicalize, user_input)
     canonical_text, canonical_signals = canonical_res
     sanitized_user = await asyncio.to_thread(sanitize_input, user_input)
+    # Use canonicalized text for injection detection (fixes Unicode bypass)
+    effective_input = canonical_text if canonical_text else user_input
 
     # 2. Intent Graph Builder (Non-blocking)
     conversation_for_graph = {
@@ -530,14 +540,18 @@ async def _analyze_turn_impl(req: TurnRequest, req_id: str, client_ip: str, star
     primary_meta = {}
     shadow_meta = {}
     risk_score = 0
-    inj_score = injection_indicator_score(user_input)
+    # Score injection on BOTH original and canonicalized text (fixes Unicode bypass)
+    inj_score = max(
+        injection_indicator_score(user_input),
+        injection_indicator_score(effective_input)
+    )
     if decoded:
         inj_score = max(inj_score, injection_indicator_score(decoded))
     
     shadow_failed = False
     disable_cache = (circuit_breaker.state != "CLOSED" or not req.intentGraph or not req.policy)
 
-    if force_contain or inj_score >= 80:
+    if force_contain or inj_score >= 70:
         primary_data = {"intent": "attack", "risk_score": 95, "action": "block", "answer": "Request blocked by safety filters."}
         primary_ok, shadow_ok = True, False
         primary_output, shadow_output, shadow_data = primary_data["answer"], "", {}

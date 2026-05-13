@@ -10,10 +10,16 @@ export async function GET() {
 
     const totalScanned = await turnsCollection.countDocuments();
     
-    const attackQuery = { riskScore: { $gt: 0.7 }, action: { $exists: true } };
+    const attackQuery = { 
+      $or: [
+        { riskLevel: { $in: ['high', 'critical'] } },
+        { 'scores.total': { $gt: 70 } }
+      ],
+      action: { $exists: true } 
+    };
     const attacksBlocked = await turnsCollection.countDocuments(attackQuery);
     
-    const fpQuery = { riskScore: { $gt: 0.7 }, action: 'ALLOW' };
+    const fpQuery = { 'scores.total': { $gt: 70 }, action: 'allow' };
     const fpCount = await turnsCollection.countDocuments(fpQuery);
     const fpRate = totalScanned > 0 ? (fpCount / totalScanned) * 100 : 0;
 

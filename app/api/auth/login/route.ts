@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import bcrypt from 'bcryptjs';
 import dbConnect from '@/lib/db';
 import User from '@/models/User';
 import { createSession, clearSession, getSession } from '@/lib/auth';
@@ -20,9 +21,15 @@ export async function POST(req: Request) {
 
     const user = await User.findOne({ email: email.trim().toLowerCase() });
 
-    // MVP: Plain text password check (DEMO ONLY)
-    // Real app: await bcrypt.compare(password, user.passwordHash)
-    if (!user || user.passwordHash !== password) {
+    if (!user) {
+      console.warn(`[auth/login] Failed login attempt for non-existent email: ${email.trim().toLowerCase()}`);
+      return NextResponse.json({ error: 'Invalid credentials' }, { status: 401 });
+    }
+
+    // Compare password using bcrypt (matches signup which hashes with bcrypt)
+    const isValid = await bcrypt.compare(password, user.passwordHash);
+    if (!isValid) {
+      console.warn(`[auth/login] Failed login attempt for email: ${email.trim().toLowerCase()}`);
       return NextResponse.json({ error: 'Invalid credentials' }, { status: 401 });
     }
 
@@ -30,6 +37,7 @@ export async function POST(req: Request) {
 
     return NextResponse.json({ success: true, role: user.role });
   } catch (error) {
+    console.error('[auth/login] Error:', error);
     return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
   }
 }

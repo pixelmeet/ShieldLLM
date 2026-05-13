@@ -12,7 +12,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "seed": "ts-node -P scripts/tsconfig.json scripts/seed.ts"
+    "seed": "ts-node -P scripts/tsconfig.json scripts/seed.ts",
+    "seed:admin": "npx tsx scripts/seed-admin.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.2.1",
