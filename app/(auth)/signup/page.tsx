@@ -9,12 +9,13 @@ import { motion } from "framer-motion";
 import { ArrowLeft, Eye, EyeOff, Loader2 } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
+import { canAccessRole } from "@/types/roles";
 import {
-  getAllRoles,
-  UserRole,
-  canAccessRole,
-} from "@/types/roles";
-import { getSignupUserFields, buildUserExtraZodShape } from "@/types/user-schema";
+  getSignupUserFields,
+  buildUserExtraZodShape,
+  getFieldOptions,
+} from "@/types/user-schema";
+import { FieldFactory, SelectField } from "@/components/user/fields";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -33,15 +34,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Textarea } from "@/components/ui/textarea";
-// import { Checkbox } from "@/components/ui/checkbox";
 
 const passwordValidation = new RegExp(
   /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]).{8,}$/
@@ -49,6 +41,8 @@ const passwordValidation = new RegExp(
 
 const extraShape = buildUserExtraZodShape();
 
+// Fix #2: Removed the `role` field from the signup form schema entirely.
+// Role is always "user" for public signups; only admins can assign roles.
 const formSchema = z
   .object({
     fullName: z.string().min(2, "Full name must be at least 2 characters."),
@@ -60,8 +54,6 @@ const formSchema = z
         "Password must be 8+ chars, with 1 uppercase, 1 lowercase, 1 number, and 1 special symbol."
       ),
     confirmPassword: z.string(),
-
-    role: z.enum(getAllRoles() as [UserRole, ...UserRole[]]).optional(),
   })
   .extend(extraShape)
   .refine((data) => data.password === data.confirmPassword, {
@@ -69,37 +61,69 @@ const formSchema = z
     path: ["confirmPassword"],
   });
 
+type SignupFormData = z.infer<typeof formSchema>;
+
 export default function SignupPage() {
   const router = useRouter();
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  // const extraFields = (typeof window !== "undefined" ? [] : []) as any;
-  const dynamicFields = getSignupUserFields().filter((f) => f.ui !== "checkbox");
-  const twoPanel = dynamicFields.length > 0;
 
-  const form = useForm<z.infer<typeof formSchema>>({
-    resolver: zodResolver(formSchema),
-    defaultValues: {
+  const dynamicFields = getSignupUserFields().filter((f) => f.ui !== "checkbox");
+
+  const getDefaultValues = () => {
+    const defaults: Record<string, unknown> = {
       fullName: "",
       email: "",
       password: "",
       confirmPassword: "",
-      ...Object.fromEntries(
-        getSignupUserFields().map((f) => [
-          f.name,
-          f.ui === "checkbox" ? false : "",
-        ])
-      ),
-    },
+    };
+    getSignupUserFields().forEach((field) => {
+      if (field.ui === "select") {
+        defaults[field.name] = "none";
+      } else {
+        defaults[field.name] = "";
+      }
+    });
+    return defaults;
+  };
+
+  const form = useForm<SignupFormData>({
+    resolver: zodResolver(formSchema),
+    defaultValues: getDefaultValues(),
   });
 
-  async function onSubmit(values: z.infer<typeof formSchema>) {
+  const handleSelectValueChange = (value: string, fieldName: string) => {
+    // Clear dependent fields when parent changes
+    if (fieldName === "country") {
+      form.setValue("state" as keyof SignupFormData, "none");
+      form.setValue("city" as keyof SignupFormData, "none");
+    } else if (fieldName === "state") {
+      form.setValue("city" as keyof SignupFormData, "none");
+    }
+  };
+
+  async function onSubmit(values: SignupFormData) {
     setIsLoading(true);
     try {
+      // Collect extra fields, converting "none" to empty string for selects
+      const extraFields: Record<string, unknown> = {};
+      getSignupUserFields().forEach((field) => {
+        let value = values[field.name as keyof typeof values];
+        if (field.ui === "select" && value === "none") {
+          value = "";
+        }
+        if (value !== undefined && value !== "") {
+          extraFields[field.name] = value;
+        }
+      });
+
       const payload = {
-        ...values,
-        role: values.role || "user",
+        fullName: values.fullName,
+        email: values.email,
+        password: values.password,
+        // No role field — server always assigns "user"
+        ...extraFields,
       };
 
       const res = await fetch("/api/auth/signup", {
@@ -137,7 +161,7 @@ export default function SignupPage() {
         initial={{ opacity: 0, y: -20 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.5 }}
-        className={`w-full ${twoPanel ? "max-w-5xl" : "max-w-md"}`}>
+        className={`w-full ${dynamicFields.length > 0 ? "max-w-3xl" : "max-w-md"}`}>
         <Card className="bg-card text-card-foreground shadow-lg">
           <CardHeader className="relative">
             <Button
@@ -158,208 +182,172 @@ export default function SignupPage() {
             <Form {...form}>
               <form
                 onSubmit={form.handleSubmit(onSubmit)}
-                className={`grid grid-cols-1 ${twoPanel ? "md:grid-cols-2" : "md:grid-cols-1"} gap-4`}>
-                <div className="space-y-4">
+                className="space-y-4">
+                {/* Core fields — Full Name & Email in a row */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <FormField
-                  control={form.control}
-                  name="fullName"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Full Name</FormLabel>
-                      <FormControl>
-                        <Input
-                          placeholder="John Doe"
-                          name={field.name}
-                          onBlur={field.onBlur}
-                          onChange={field.onChange}
-                          ref={field.ref}
-                          value={(field.value as string) ?? ""}
-                          disabled={isLoading}
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                  />
-                  <FormField
-                  control={form.control}
-                  name="email"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Email</FormLabel>
-                      <FormControl>
-                        <Input
-                          placeholder="john@example.com"
-                          type="email"
-                          name={field.name}
-                          onBlur={field.onBlur}
-                          onChange={field.onChange}
-                          ref={field.ref}
-                          value={(field.value as string) ?? ""}
-                          disabled={isLoading}
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                  />
-                  <FormField
-                  control={form.control}
-                  name="password"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Password</FormLabel>
-                      <FormControl>
-                        <div className="relative">
+                    control={form.control}
+                    name="fullName"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Full Name</FormLabel>
+                        <FormControl>
                           <Input
-                            type={showPassword ? "text" : "password"}
-                            placeholder="••••••••"
-                            name={field.name}
-                            onBlur={field.onBlur}
-                            onChange={field.onChange}
-                            ref={field.ref}
-                            value={(field.value as string) ?? ""}
+                            placeholder="John Doe"
+                            {...field}
+                            value={field.value as string}
                             disabled={isLoading}
                           />
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon"
-                            className="absolute inset-y-0 right-0"
-                            onClick={() => setShowPassword(!showPassword)}
-                            disabled={isLoading}>
-                            {showPassword ? (
-                              <EyeOff className="h-4 w-4" />
-                            ) : (
-                              <Eye className="h-4 w-4" />
-                            )}
-                          </Button>
-                        </div>
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
                   />
                   <FormField
-                  control={form.control}
-                  name="confirmPassword"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Confirm Password</FormLabel>
-                      <FormControl>
-                        <div className="relative">
+                    control={form.control}
+                    name="email"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Email</FormLabel>
+                        <FormControl>
                           <Input
-                            type={showConfirmPassword ? "text" : "password"}
-                            placeholder="••••••••"
-                            name={field.name}
-                            onBlur={field.onBlur}
-                            onChange={field.onChange}
-                            ref={field.ref}
-                            value={(field.value as string) ?? ""}
+                            placeholder="john@example.com"
+                            type="email"
+                            {...field}
+                            value={field.value as string}
                             disabled={isLoading}
                           />
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon"
-                            className="absolute inset-y-0 right-0"
-                            onClick={() =>
-                              setShowConfirmPassword(!showConfirmPassword)
-                            }
-                            disabled={isLoading}>
-                            {showConfirmPassword ? (
-                              <EyeOff className="h-4 w-4" />
-                            ) : (
-                              <Eye className="h-4 w-4" />
-                            )}
-                          </Button>
-                        </div>
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
                   />
                 </div>
 
-                {twoPanel && (
-                  <div className="space-y-4">
-                    {dynamicFields.map((def) => (
-                    <FormField
-                      key={def.name}
-                      control={form.control}
-                      name={def.name as keyof z.infer<typeof formSchema>}
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>{def.label}</FormLabel>
-                          <FormControl>
-                            {def.ui === "textarea" ? (
-                              <Textarea
-                                placeholder={def.placeholder || def.label}
-                                name={field.name}
-                                onBlur={field.onBlur}
-                                onChange={field.onChange}
-                                ref={field.ref}
-                                value={(field.value as string) ?? ""}
-                                disabled={isLoading}
-                              />
-                            ) : def.ui === "select" ? (
-                              <Select
-                                onValueChange={field.onChange}
-                                defaultValue={field.value as string | undefined}>
-                                <SelectTrigger>
-                                  <SelectValue
-                                    placeholder={def.placeholder || `Select ${def.label.toLowerCase()}`}
-                                  />
-                                </SelectTrigger>
-                                <SelectContent>
-                                  {(def.options || []).map((opt) => (
-                                    <SelectItem key={opt.value} value={opt.value}>
-                                      {opt.label}
-                                    </SelectItem>
-                                  ))}
-                                </SelectContent>
-                              </Select>
-                            ) : def.ui === "checkbox" ? (
-                              null
-                            ) : (
-                              <Input
-                                type={
-                                  def.ui === "date"
-                                    ? "date"
-                                    : def.ui === "url"
-                                    ? "url"
-                                    : "text"
-                                }
-                                placeholder={def.placeholder || def.label}
-                                name={field.name}
-                                onBlur={field.onBlur}
-                                onChange={field.onChange}
-                                ref={field.ref}
-                                value={(field.value as string) ?? ""}
-                                disabled={isLoading}
-                              />
-                            )}
-                          </FormControl>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
-                  ))}
+                {/* Password fields in a row */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <FormField
+                    control={form.control}
+                    name="password"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Password</FormLabel>
+                        <FormControl>
+                          <div className="relative">
+                            <Input
+                              type={showPassword ? "text" : "password"}
+                              placeholder="••••••••"
+                              {...field}
+                              value={field.value as string}
+                              disabled={isLoading}
+                            />
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              className="absolute inset-y-0 right-0"
+                              onClick={() => setShowPassword(!showPassword)}
+                              disabled={isLoading}>
+                              {showPassword ? (
+                                <EyeOff className="h-4 w-4" />
+                              ) : (
+                                <Eye className="h-4 w-4" />
+                              )}
+                            </Button>
+                          </div>
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name="confirmPassword"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Confirm Password</FormLabel>
+                        <FormControl>
+                          <div className="relative">
+                            <Input
+                              type={showConfirmPassword ? "text" : "password"}
+                              placeholder="••••••••"
+                              {...field}
+                              value={field.value as string}
+                              disabled={isLoading}
+                            />
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              className="absolute inset-y-0 right-0"
+                              onClick={() =>
+                                setShowConfirmPassword(!showConfirmPassword)
+                              }
+                              disabled={isLoading}>
+                              {showConfirmPassword ? (
+                                <EyeOff className="h-4 w-4" />
+                              ) : (
+                                <Eye className="h-4 w-4" />
+                              )}
+                            </Button>
+                          </div>
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </div>
+
+                {/* Fix #3: Dynamic fields now use FieldFactory / SelectField,
+                    matching the admin create-user-dialog rendering approach */}
+                {dynamicFields.length > 0 && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {dynamicFields.map((def) => {
+                      if (def.ui === "select") {
+                        let options = def.options || [];
+                        if (def.dependsOn) {
+                          const dependentValue = form.getValues(
+                            def.dependsOn as keyof SignupFormData
+                          ) as string;
+                          options = getFieldOptions(def.name, dependentValue);
+                        }
+
+                        return (
+                          <SelectField
+                            key={def.name}
+                            name={def.name as keyof SignupFormData}
+                            control={form.control}
+                            label={def.label}
+                            options={options}
+                            disabled={isLoading}
+                            onValueChange={handleSelectValueChange}
+                          />
+                        );
+                      }
+
+                      return (
+                        <FieldFactory
+                          key={def.name}
+                          fieldDef={def}
+                          control={form.control}
+                          disabled={isLoading}
+                          onSelectValueChange={handleSelectValueChange}
+                        />
+                      );
+                    })}
                   </div>
                 )}
 
-                <div className={`${twoPanel ? "md:col-span-2" : "md:col-span-1"} flex items-center justify-center pt-2`}>
-                  <Button
-                    type="submit"
-                    className="min-w-40 bg-primary text-primary-foreground hover:bg-primary/90"
-                    disabled={isLoading}>
-                    {isLoading ? (
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    ) : (
-                      "Sign Up"
-                    )}
-                  </Button>
-                </div>
+                <Button
+                  type="submit"
+                  className="w-full bg-primary text-primary-foreground hover:bg-primary/90"
+                  disabled={isLoading}>
+                  {isLoading ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    "Sign Up"
+                  )}
+                </Button>
               </form>
             </Form>
             <div className="mt-4 text-center text-sm">

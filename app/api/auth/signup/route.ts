@@ -14,7 +14,11 @@ export async function POST(request: Request) {
 
   try {
     const body = await request.json();
-    const { fullName, email, password, role = "user" } = body;
+    const { fullName, email, password } = body;
+
+    // SECURITY: Always force role to "user" on public signup.
+    // Role assignment is an admin-only privilege via createAdminUserAction.
+    const role: UserRole = "user";
 
     if (!email || !password || !fullName) {
       return NextResponse.json(
