@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import dotenv from 'dotenv';
 import path from 'path';
+import bcrypt from 'bcryptjs';
 
 // Construct path to .env file at project root
 const envPath = path.resolve(process.cwd(), '.env');
@@ -32,22 +33,29 @@ async function seed() {
     await Alert.deleteMany({});
     console.log('🧹 Cleared existing data');
 
-    // 1. Create Users
+    // 1. Create Users (passwords properly bcrypt-hashed)
+    const adminHash = await bcrypt.hash('admin', 12);
+    const devHash = await bcrypt.hash('dev', 12);
+    const secHash = await bcrypt.hash('sec', 12);
+
     const users = await User.insertMany([
         {
+            fullName: 'System Admin',
             email: 'admin@shield.com',
-            passwordHash: 'admin', // In real app, hash this!
+            passwordHash: adminHash,
             role: 'admin'
         },
         {
+            fullName: 'Developer User',
             email: 'dev@shield.com',
-            passwordHash: 'dev',
-            role: 'developer'
+            passwordHash: devHash,
+            role: 'user'
         },
         {
+            fullName: 'Security Engineer',
             email: 'sec@shield.com',
-            passwordHash: 'sec',
-            role: 'security_engineer'
+            passwordHash: secHash,
+            role: 'moderator'
         }
     ]);
     console.log(`👤 Created ${users.length} users`);

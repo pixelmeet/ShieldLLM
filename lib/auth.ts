@@ -8,12 +8,12 @@ const SECRET_KEY = process.env.AUTH_SECRET || 'secret';
 export async function createSession(userId: string, role: string) {
     const token = jwt.sign({ userId, role }, SECRET_KEY, { expiresIn: '1d' });
     const cookieStore = await cookies();
-    cookieStore.set('session_token', token, { httpOnly: true, secure: process.env.NODE_ENV === 'production', path: '/' });
+    cookieStore.set('auth_token', token, { httpOnly: true, secure: process.env.NODE_ENV === 'production', path: '/' });
 }
 
 export async function getSession() {
     const cookieStore = await cookies();
-    const token = cookieStore.get('session_token')?.value;
+    const token = cookieStore.get('auth_token')?.value;
 
     if (!token) return null;
 
@@ -27,7 +27,7 @@ export async function getSession() {
 
 export async function clearSession() {
     const cookieStore = await cookies();
-    cookieStore.delete('session_token');
+    cookieStore.delete('auth_token');
 }
 
 export async function requireAuth(roles: string[] = []) {

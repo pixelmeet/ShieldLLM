@@ -11,6 +11,7 @@ load_dotenv(_root / ".env")       # defaults
 load_dotenv(_root / ".env.local") # secrets (Next.js convention, gitignored)
 
 from fastapi import FastAPI, HTTPException, Body, Header
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 import asyncio
@@ -33,6 +34,18 @@ import binascii
 import re
 
 app = FastAPI(title="ShieldLLM Defense Service", description="Dual-LLM Prompt Injection Defense")
+
+allowed_origin = os.getenv("ALLOWED_ORIGIN", "*")
+origins = [allowed_origin, "http://localhost:3000", "http://localhost:3001"] if allowed_origin != "*" else ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True if allowed_origin != "*" else False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 logger = logging.getLogger("shieldllm.defense")
 
 # --- Multi-turn Conversation Store (FIX 3) ---

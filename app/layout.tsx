@@ -28,7 +28,10 @@ export default function RootLayout({
             <div className="flex gap-6 text-sm font-medium text-neutral-400">
               <Link href="/" className="hover:text-white transition-colors">Home</Link>
               <Link href="/dashboard" className="hover:text-white transition-colors">Dashboard</Link>
+              <Link href="/ile-guard" className="hover:text-white transition-colors">ILE Guard</Link>
+              <Link href="/metrics" className="hover:text-white transition-colors">Metrics</Link>
               <Link href="/logs" className="hover:text-white transition-colors">Logs</Link>
+              <Link href="/api-console" className="hover:text-white transition-colors">API Console</Link>
               <Link href="/auth/login" className="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-md text-white transition-colors">Login</Link>
             </div>
           </div>

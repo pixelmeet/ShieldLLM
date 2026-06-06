@@ -9,5 +9,6 @@ python-multipart
 python-dotenv
 openai>=1.0.0
 huggingface_hub>=0.24.0
+cachetools
 # For LLM_MODE=transformers (optional):
 # transformers>=4.30.0 torch

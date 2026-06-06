@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import TopNavigationBar from '@/components/ile-guard/TopNavigationBar';
 import UserInteractionPanel from '@/components/ile-guard/UserInteractionPanel';
 import IntentVisualizationPanel from '@/components/ile-guard/IntentVisualizationPanel';
@@ -13,6 +13,13 @@ export default function ILEGuardDashboard() {
     const [conversationHistory, setConversationHistory] = useState<any[]>([]);
     const [analysisResult, setAnalysisResult] = useState<any>(null);
     const [intentGraph, setIntentGraph] = useState<Record<string, any>>({});
+
+    const sessionIdRef = useRef<string | null>(null);
+    if (!sessionIdRef.current) {
+        sessionIdRef.current = typeof crypto !== 'undefined' && crypto.randomUUID
+            ? crypto.randomUUID()
+            : `session-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    }
 
     const handleSubmitPrompt = async (prompt: string) => {
         setProtectionStatus('analyzing');
@@ -28,7 +35,7 @@ export default function ILEGuardDashboard() {
                     defenseMode: 'active',
                     policy: {},
                     modelType: 'groq',
-                    sessionId: 'ile-guard-demo',
+                    sessionId: sessionIdRef.current,
                 }),
             });
 
