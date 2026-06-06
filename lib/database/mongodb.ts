@@ -11,12 +11,17 @@ export const MongoDbAdapter: DatabaseAdapter = {
   async findUserByEmail(email) {
     const users = await getUsersCollection();
     const user = await users.findOne({ email: email.toLowerCase() });
-    return user ? ({ ...user, _id: undefined } as User) : null;
+    return user ? ({ ...user, id: user.id || user._id.toString(), _id: undefined } as User) : null;
   },
   async findUserById(id) {
     const users = await getUsersCollection();
-    const user = await users.findOne({ id });
-    return user ? ({ ...user, _id: undefined } as User) : null;
+    const { ObjectId } = require('mongodb');
+    let query: any = { id };
+    if (typeof id === 'string' && id.length === 24 && /^[0-9a-fA-F]{24}$/.test(id)) {
+      query = { $or: [ { id }, { _id: new ObjectId(id) } ] };
+    }
+    const user = await users.findOne(query);
+    return user ? ({ ...user, id: user.id || user._id.toString(), _id: undefined } as User) : null;
   },
   async createUser(user) {
     const users = await getUsersCollection();
@@ -25,16 +30,26 @@ export const MongoDbAdapter: DatabaseAdapter = {
   },
   async updateUser(id, userData) {
     const users = await getUsersCollection();
+    const { ObjectId } = require('mongodb');
+    let query: any = { id };
+    if (typeof id === 'string' && id.length === 24 && /^[0-9a-fA-F]{24}$/.test(id)) {
+      query = { $or: [ { id }, { _id: new ObjectId(id) } ] };
+    }
     const result = await users.findOneAndUpdate(
-      { id },
+      query,
       { $set: userData },
       { returnDocument: "after" }
     );
-    return result ? ({ ...result, _id: undefined } as User) : null;
+    return result ? ({ ...result, id: result.id || result._id.toString(), _id: undefined } as User) : null;
   },
   async deleteUserById(id) {
     const users = await getUsersCollection();
-    const result = await users.deleteOne({ id });
+    const { ObjectId } = require('mongodb');
+    let query: any = { id };
+    if (typeof id === 'string' && id.length === 24 && /^[0-9a-fA-F]{24}$/.test(id)) {
+      query = { $or: [ { id }, { _id: new ObjectId(id) } ] };
+    }
+    const result = await users.deleteOne(query);
     return result.deletedCount > 0;
   },
   async getAdminAnalytics() {

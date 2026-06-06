@@ -46,12 +46,13 @@ body {
   border-radius: 12px;
   transition: all 0.2s;
   cursor: pointer;
+
+  &:hover {
+    background: var(--bg-card-hover);
+    border-color: var(--border-glow);
+  }
 }
 
-@utility glass-panel-hover:hover {
-  background: var(--bg-card-hover);
-  border-color: var(--border-glow);
-}
 
 @utility glow-cyan {
   box-shadow: 0 0 20px rgba(0,242,254,0.15), 0 0 40px rgba(0,242,254,0.05);
@@ -140,8 +141,10 @@ body {
   animation: pulseThreat 2s ease-in-out infinite;
 }
 
-scrollbar-width: thin;
-scrollbar-color: rgba(0,242,254,0.2) transparent;
+html {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0,242,254,0.2) transparent;
+}
 
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }

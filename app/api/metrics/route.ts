@@ -33,7 +33,7 @@ export async function GET() {
       { $match: attackQuery },
       { $group: { _id: '$attackType', count: { $sum: 1 } } },
       { $project: { _id: 0, type: { $ifNull: ['$_id', 'Unknown'] }, count: 1 } }
-    ]).toArray();
+    ]).toArray() as unknown as Array<{ type: string; count: number }>;
 
     const standardTypes = ['Direct Injection', 'Multi-Turn', 'Obfuscation', 'Unknown'];
     const formattedBreakdown = standardTypes.map(type => {

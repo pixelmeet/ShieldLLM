@@ -28,7 +28,6 @@ export async function getCurrentUserAction() {
     const user = await db.findUserById(userId);
 
     if (!user) {
-      cookieStore.delete("auth_token");
       return null;
     }
 
@@ -40,7 +39,6 @@ export async function getCurrentUserAction() {
     };
   } catch (error) {
     console.error("Authentication error in server action:", error);
-    cookieStore.delete("auth_token");
     return null;
   }
 }

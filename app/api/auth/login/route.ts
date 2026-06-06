@@ -1,8 +1,11 @@
 import { NextResponse } from 'next/server';
 import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 import dbConnect from '@/lib/db';
 import User from '@/models/User';
-import { createSession, clearSession, getSession } from '@/lib/auth';
+import { clearSession, getSession } from '@/lib/auth';
+
+const SECRET_KEY = process.env.AUTH_SECRET || 'secret';
 
 export async function POST(req: Request) {
   try {
@@ -33,9 +36,19 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Invalid credentials' }, { status: 401 });
     }
 
-    await createSession(user._id.toString(), user.role);
+    const userId = user.get('id') || user._id.toString();
+    const token = jwt.sign({ userId, role: user.role }, SECRET_KEY, { expiresIn: '1d' });
 
-    return NextResponse.json({ success: true, role: user.role });
+    const response = NextResponse.json({ success: true, role: user.role });
+    response.cookies.set("auth_token", token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "strict",
+      maxAge: 86400,
+      path: "/",
+    });
+
+    return response;
   } catch (error) {
     console.error('[auth/login] Error:', error);
     return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });

@@ -9,7 +9,13 @@ const AlertSchema = new Schema({
         required: true
     },
     title: { type: String, required: true },
+    status: {
+        type: String,
+        enum: ['pending', 'resolved', 'dismissed'],
+        default: 'pending'
+    },
     createdAt: { type: Date, default: Date.now },
 });
 
 export default models.Alert || mongoose.model('Alert', AlertSchema);
+
