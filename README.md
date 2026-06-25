@@ -29,18 +29,18 @@ See `.env.example` for LM Studio and Transformers options. Use "Simulated" sessi
 
 ### 2. Install Dependencies
 ```bash
-# Frontend
-npm install
+# Frontend dependencies
+npm --prefix frontend install
 
-# Backend
-pip install -r defense_service/requirements.txt
+# Backend dependencies
+pip install -r backend/defense_service/requirements.txt
 ```
 
 ### 3. Seed Database
 Initialize with default users and policy:
 ```bash
 npm run seed
-# Or: npx ts-node scripts/seed.ts
+# Or: npx ts-node frontend/scripts/seed.ts
 ```
 
 ### 4. Run Application
@@ -48,13 +48,13 @@ You need the Next.js frontend and the Python defense service.
 
 **Terminal 1 (Defense Service):**
 ```bash
-cd defense_service
+cd backend/defense_service
  python -m uvicorn main:app --reload --port 5000
 ```
 
 **Terminal 2 (Frontend):**
 ```bash
-npm run dev
+npm --prefix frontend run dev
 ```
 
 Or run both: `npm run dev:all`
@@ -74,7 +74,7 @@ The defense service supports two modes via `LLM_MODE` in `.env`:
 
 **Option B: Transformers (In-Process)**
 1. In `.env`: `LLM_MODE=transformers`, `PRIMARY_MODEL=meta-llama/Llama-2-7b-chat-hf` (or smaller), `MODEL_DEVICE=cpu`
-2. `pip install transformers torch` in `defense_service/`
+2. `pip install transformers torch` in `backend/defense_service/`
 3. Models load at startup; first request may be slow
 
 **Option C: Simulated (No LLM)**
@@ -128,13 +128,10 @@ The defense service continues to work when Primary or Shadow models are unavaila
     - Modal appears explaining the blockage.
 
 ## 📂 Project Structure
-- `/app`: Next.js App Router (Frontend)
-- `/backend`: Python FastAPI (ShieldLLM Backend — optional ILE backend)
-- `/defense_service`: Python FastAPI (Dual-LLM Defense; LM Studio, Transformers, or HF/OpenAI)
-- `/shadow_server`: Phi-4 shadow model server (optional)
-- `/lib`: Shared utilities (DB, Auth)
-- `/models`: Mongoose Schemas
-- `/scripts`: Database Seeding, E2E smoke test
+- `/frontend`: Next.js app (UI plus App Router routes)
+- `/backend/defense_service`: Python FastAPI dual-LLM defense service
+- `/backend/node-core`: Extracted Node server-side models/libs used by API routes
+- `/frontend/scripts`: Database seeding and smoke-test utilities
 
 ### E2E Smoke Test
 ```bash
